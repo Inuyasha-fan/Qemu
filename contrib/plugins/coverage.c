@@ -114,17 +114,14 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata) {
 
 	g_mutex_lock(&lock);
 	Coverage *cnt = (Coverage *)g_hash_table_lookup(coverage_map, (gconstpointer)(uintptr_t)virt_addr);
-	if (!cnt) {
-		g_mutex_unlock(&lock);
-		return;
-	}
+	g_assert(cnt);
 	cnt->exec_count++;
 
 	uint64_t cur_loc = (virt_addr >> 4) ^ (virt_addr << 8);
 	cur_loc &= EDGE_MAP_SIZE - 1;
 
 	// 边覆盖和轨迹只在采样范围内记录
-	if (entry_info.inst_ratio == 0 || cur_loc < entry_info.inst_ratio) {
+	if (cur_loc < entry_info.inst_ratio) {
 		uint32_t edge_idx = cur_loc ^ prev_loc_exec;
 		if (edge_map[edge_idx] == 0) {
 			edge_count++;
@@ -275,8 +272,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
 		);
 	}
 
-	char *yaml_elf_path = NULL;
-	ParseResult ret = parse_config(config_path, &entry_info, &yaml_elf_path, &mode);
+	char *elf_path = NULL;
+	ParseResult ret = parse_config(config_path, &entry_info, &elf_path, &mode);
 	if (ret != PARSE_OK) {
 		g_error("failed to parse config: %s", config_path);
 		return -1;
@@ -294,15 +291,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
 			return -1;
 		}
 	} else {
-		if ((mode == 1 || mode == 2) && (!yaml_elf_path || yaml_elf_path[0] == '\0')) {
+		if ((mode == 1 || mode == 2) && (!elf_path || elf_path[0] == '\0')) {
 			g_error("mode %d requires elf_path in config", mode);
 			return -1;
 		}
 
 		if (mode == 1 || mode == 2) {
-			ParseResult elf_ret = parse_elf(yaml_elf_path, &entry_info);
+			ParseResult elf_ret = parse_elf(elf_path, &entry_info);
 			if (elf_ret != PARSE_OK) {
-				g_error("failed to parse ELF: %s", yaml_elf_path);
+				g_error("failed to parse ELF: %s", elf_path);
 				return -1;
 			}
 		}
@@ -321,8 +318,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
 		}
 	}
 
-	if (yaml_elf_path) {
-		g_free(yaml_elf_path);
+	if (elf_path) {
+		g_free(elf_path);
 	}
 
 	g_info("inst_ratio: %" PRIu32, entry_info.inst_ratio);

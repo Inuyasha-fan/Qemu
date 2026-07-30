@@ -83,7 +83,7 @@ static void bytes_to_instrs(uint8_t *buf, size_t len, ElfEntryInfo *info) {
 	}
 }
 
-// 解析 YAML 配置文件，返回 mode 及 ELF 路径，剩余字段填入 info
+// 解析 JSON 配置文件，返回 mode 及 ELF 路径，剩余字段填入 info
 ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_out, int *mode_out) {
 	g_autofree char *content = NULL;
 	gsize len;
@@ -99,6 +99,7 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 		*mode_out = -1;
 	}
 
+	// 简化 JSON 解析：按行处理 key-value 对
 	g_auto(GStrv) lines = g_strsplit(content, "\n", 0);
 	int list_count = 0;
 	gboolean in_list = FALSE;
@@ -106,32 +107,32 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 	for (int i = 0; lines[i]; i++) {
 		g_autofree char *raw_line = g_strdup(lines[i]);
 		char *line = g_strstrip(raw_line);
-		if (line[0] == '#' || line[0] == '\0') {
+
+		// 跳过空行、注释和纯符号行
+		if (line[0] == '\0' || line[0] == '/' || line[0] == '#'
+			|| line[0] == '{' || line[0] == '}') {
 			continue;
 		}
 
-		// 列表项
+		// 列表项处理
 		if (in_list) {
-			if (g_str_has_prefix(line, "- ")) {
-				const char *val = line + 2;
-				val += strspn(val, " ");
-				g_autofree char *v = g_strdup(val);
-				g_strstrip(v);
-				size_t vlen = strlen(v);
-				if (vlen > 1 && v[0] == '"' && v[vlen - 1] == '"') {
-					v[vlen - 1] = '\0';
-					memmove(v, v + 1, vlen);
+			if (line[0] == '"') {
+				const char *val = line + 1;
+				const char *end = strchr(val, '"');
+				if (end) {
+					g_autofree char *v = g_strndup(val, end - val);
+					if (list_count < ENTRY_INSTR_COUNT) {
+						info->instrs[list_count] = (uint32_t)g_ascii_strtoull(v, NULL, 16);
+						info->instr_count = list_count + 1;
+					}
+					list_count++;
 				}
-				if (list_count < ENTRY_INSTR_COUNT) {
-					info->instrs[list_count] = (uint32_t)g_ascii_strtoull(v, NULL, 16);
-					info->instr_count = list_count + 1;
-				}
-				list_count++;
 				continue;
 			}
 			in_list = FALSE;
 		}
 
+		// 解析 key: value 对
 		g_auto(GStrv) kv = g_strsplit(line, ":", 2);
 		if (!kv[0] || !kv[1]) {
 			continue;
@@ -141,19 +142,25 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 		char *key = g_strstrip(key_raw);
 		char *val = g_strstrip(val_raw);
 
-		if (val[0] == '\0') {
-			if (g_strcmp0(key, "entry_code") == 0) {
-				in_list = TRUE;
-				list_count = 0;
-			}
-			continue;
+		// 去除 key 的引号
+		if (key[0] == '"') {
+			key++;
+		}
+		size_t klen = strlen(key);
+		if (klen > 1 && key[klen - 1] == '"') {
+			key[klen - 1] = '\0';
 		}
 
+		// 去除 val 的引号和尾逗号
+		size_t vlen = strlen(val);
+		if (vlen > 0 && val[vlen - 1] == ',') {
+			val[--vlen] = '\0';
+		}
+		if (vlen > 0 && val[vlen - 1] == '"') {
+			val[--vlen] = '\0';
+		}
 		if (val[0] == '"') {
 			val++;
-		}
-		if (val[strlen(val) - 1] == '"') {
-			val[strlen(val) - 1] = '\0';
 		}
 
 		if (g_strcmp0(key, "mode") == 0) {
@@ -161,19 +168,28 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 				*mode_out = (int)g_ascii_strtoull(val, NULL, 10);
 			}
 		} else if (g_strcmp0(key, "elf_path") == 0) {
-			if (elf_path_out) {
+			if (elf_path_out && val[0] != '\0') {
 				*elf_path_out = g_strdup(val);
 			}
 		} else if (g_strcmp0(key, "entry_addr") == 0) {
-			info->addr = g_ascii_strtoull(val, NULL, 16);
+			if (val[0] != '\0') {
+				info->addr = g_ascii_strtoull(val, NULL, 16);
+			}
 		} else if (g_strcmp0(key, "text_start") == 0) {
-			info->text_start = g_ascii_strtoull(val, NULL, 16);
+			if (val[0] != '\0') {
+				info->text_start = g_ascii_strtoull(val, NULL, 16);
+			}
 		} else if (g_strcmp0(key, "text_size") == 0) {
-			info->text_size = g_ascii_strtoull(val, NULL, 16);
+			if (val[0] != '\0') {
+				info->text_size = g_ascii_strtoull(val, NULL, 16);
+			}
 		} else if (g_strcmp0(key, "inst_ratio") == 0) {
 			info->inst_ratio = (uint32_t)g_ascii_strtoull(val, NULL, 10);
 		} else if (g_strcmp0(key, "debug") == 0) {
 			info->debug = (g_strcmp0(val, "true") == 0 || g_strcmp0(val, "1") == 0);
+		} else if (g_strcmp0(key, "entry_code") == 0) {
+			in_list = TRUE;
+			list_count = 0;
 		}
 	}
 
