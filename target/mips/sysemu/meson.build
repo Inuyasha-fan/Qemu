@@ -4,5 +4,6 @@ mips_system_ss.add(files(
   'cp0_timer.c',
   'machine.c',
   'mips-qmp-cmds.c',
+  'monitor.c',
   'physaddr.c',
 ))

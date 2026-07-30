@@ -219,6 +219,16 @@ ERST
     },
 #endif
 
+#if defined(TARGET_MIPS)
+    {
+        .name       = "asid",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show current ASID (Address Space Identifier)",
+        .cmd        = hmp_info_asid,
+    },
+#endif
+
 SRST
   ``info tlb``
     Show virtual to physical memory mappings.

@@ -15379,6 +15379,7 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     CPUMIPSState *env = cpu_env(cs);
 
     ctx->page_start = ctx->base.pc_first & TARGET_PAGE_MASK;
+    dcbase->plugin_asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
     ctx->saved_pc = -1;
     ctx->insn_flags = env->insn_flags;
     ctx->CP0_Config0 = env->CP0_Config0;

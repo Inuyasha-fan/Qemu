@@ -376,6 +376,44 @@ struct qemu_plugin_insn *
 qemu_plugin_tb_get_insn(const struct qemu_plugin_tb *tb, size_t idx);
 
 /**
+ * qemu_plugin_tb_get_asid() - query helper for ASID of TB
+ * @tb: opaque handle to TB passed to callback
+ *
+ * Returns the address space identifier (ASID) of the process
+ * that owns this translation block. Returns 0 if not available.
+ *
+ * Returns: ASID value
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_tb_get_asid(const struct qemu_plugin_tb *tb);
+
+/**
+ * qemu_plugin_tb_get_phys_addr() - query helper for physical address of TB
+ * @tb: opaque handle to TB passed to callback
+ *
+ * Returns the physical address of the first instruction in this
+ * translation block, or (uint64_t)-1 if the page is not mapped.
+ *
+ * Returns: physical address or (uint64_t)-1
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_tb_get_phys_addr(const struct qemu_plugin_tb *tb);
+
+/**
+ * qemu_plugin_read_phys_memory() - read guest physical memory
+ * @phys_addr: guest physical address to read from
+ * @buf: buffer to store data into
+ * @len: number of bytes to read
+ *
+ * Reads @len bytes from guest physical address @phys_addr into @buf.
+ * Only available in system emulation mode.
+ *
+ * Returns: number of bytes read on success, or negative value on error
+ */
+QEMU_PLUGIN_API
+ssize_t qemu_plugin_read_phys_memory(uint64_t phys_addr, void *buf, size_t len);
+
+/**
  * qemu_plugin_insn_data() - return ptr to instruction data
  * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
  *

@@ -13,6 +13,7 @@ TOP_SRC_PATH = $(SRC_PATH)/../..
 VPATH += $(SRC_PATH)
 
 NAMES :=
+NAMES += coverage
 NAMES += execlog
 NAMES += hotblocks
 NAMES += hotpages
@@ -42,11 +43,15 @@ SONAMES := $(addsuffix $(SO_SUFFIX),$(addprefix lib,$(NAMES)))
 PLUGIN_CFLAGS := $(shell $(PKG_CONFIG) --cflags glib-2.0)
 PLUGIN_CFLAGS += -fPIC -Wall
 PLUGIN_CFLAGS += -I$(TOP_SRC_PATH)/include/qemu
+PLUGIN_CFLAGS += -I$(TOP_SRC_PATH)/include
 
 all: $(SONAMES)
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(PLUGIN_CFLAGS) -c -o $@ $<
+
+libcoverage.so: coverage.o common.o
+	$(CC) -shared -o $@ $^ $(LDLIBS)
 
 ifeq ($(CONFIG_WIN32),y)
 lib%$(SO_SUFFIX): %.o win32_linker.o ../../plugins/libqemu_plugin_api.a

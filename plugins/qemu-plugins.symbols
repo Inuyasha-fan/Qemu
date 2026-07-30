@@ -37,9 +37,12 @@
   qemu_plugin_register_vcpu_tb_trans_cb;
   qemu_plugin_reset;
   qemu_plugin_start_code;
+  qemu_plugin_tb_get_asid;
   qemu_plugin_tb_get_insn;
+  qemu_plugin_tb_get_phys_addr;
   qemu_plugin_tb_n_insns;
   qemu_plugin_tb_vaddr;
+  qemu_plugin_read_phys_memory;
   qemu_plugin_uninstall;
   qemu_plugin_vcpu_for_each;
 };

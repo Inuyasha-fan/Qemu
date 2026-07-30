@@ -45,6 +45,7 @@
 #ifndef CONFIG_USER_ONLY
 #include "qemu/plugin-memory.h"
 #include "hw/boards.h"
+#include "exec/cpu-common.h"
 #else
 #include "qemu.h"
 #ifdef CONFIG_LINUX
@@ -191,6 +192,16 @@ size_t qemu_plugin_tb_n_insns(const struct qemu_plugin_tb *tb)
 uint64_t qemu_plugin_tb_vaddr(const struct qemu_plugin_tb *tb)
 {
     return tb->vaddr;
+}
+
+uint64_t qemu_plugin_tb_get_asid(const struct qemu_plugin_tb *tb)
+{
+    return tb->asid;
+}
+
+uint64_t qemu_plugin_tb_get_phys_addr(const struct qemu_plugin_tb *tb)
+{
+    return tb->phys_addr;
 }
 
 struct qemu_plugin_insn *
@@ -341,6 +352,22 @@ const char *qemu_plugin_hwaddr_device_name(const struct qemu_plugin_hwaddr *h)
     return g_intern_static_string("Invalid");
 #endif
 }
+
+#ifndef CONFIG_USER_ONLY
+ssize_t qemu_plugin_read_phys_memory(uint64_t phys_addr, void *buf, size_t len) {
+    cpu_physical_memory_read((hwaddr)phys_addr, buf, (hwaddr)len);
+    return (ssize_t)len;
+}
+#else
+ssize_t qemu_plugin_read_phys_memory(uint64_t phys_addr, void *buf, size_t len) {
+    // user 模式下虚拟地址即物理地址
+    if (!current_cpu) {
+        return -1;
+    }
+    int ret = cpu_memory_rw_debug(current_cpu, phys_addr, buf, len, false);
+    return ret == 0 ? (ssize_t)len : (ssize_t)ret;
+}
+#endif
 
 /*
  * Queries to the number and potential maximum number of vCPUs there

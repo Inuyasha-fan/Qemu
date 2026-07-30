@@ -816,6 +816,22 @@ bool plugin_gen_tb_start(CPUState *cpu, const DisasContextBase *db,
         ptb->haddr2 = NULL;
         ptb->mem_only = mem_only;
         ptb->mem_helper = false;
+        ptb->asid = db->plugin_asid;
+
+#ifndef CONFIG_USER_ONLY
+        {
+            MemTxAttrs attrs;
+            hwaddr phys = cpu_get_phys_page_attrs_debug(
+                cpu, db->pc_first & TARGET_PAGE_MASK, &attrs);
+            if (phys != (hwaddr)-1) {
+                ptb->phys_addr = phys | (db->pc_first & ~TARGET_PAGE_MASK);
+            } else {
+                ptb->phys_addr = (uint64_t)-1;
+            }
+        }
+#else
+        ptb->phys_addr = ptb->vaddr;
+#endif
 
         plugin_gen_empty_callback(PLUGIN_GEN_FROM_TB);
     }

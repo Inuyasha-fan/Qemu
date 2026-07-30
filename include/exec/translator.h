@@ -88,6 +88,7 @@ typedef struct DisasContextBase {
     int8_t saved_can_do_io;
     bool plugin_enabled;
     void *host_addr[2];
+    target_ulong plugin_asid;
 } DisasContextBase;
 
 /**
