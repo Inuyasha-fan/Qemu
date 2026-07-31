@@ -187,6 +187,8 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 			info->inst_ratio = (uint32_t)g_ascii_strtoull(val, NULL, 10);
 		} else if (g_strcmp0(key, "debug") == 0) {
 			info->debug = (g_strcmp0(val, "true") == 0 || g_strcmp0(val, "1") == 0);
+		} else if (g_strcmp0(key, "fuzz") == 0) {
+			info->fuzz = (g_strcmp0(val, "true") == 0 || g_strcmp0(val, "1") == 0);
 		} else if (g_strcmp0(key, "entry_code") == 0) {
 			in_list = TRUE;
 			list_count = 0;
@@ -424,4 +426,19 @@ uint64_t try_identify_target(const ElfEntryInfo *info, uint64_t asid, uint64_t p
 	}
 
 	return asid;
+}
+
+// 深度拷贝 coverage_map
+GHashTable *deep_copy_coverage_map(GHashTable *src) {
+	GHashTable *dst = g_hash_table_new(NULL, g_direct_equal);
+	GHashTableIter iter;
+	gpointer key, value;
+	g_hash_table_iter_init(&iter, src);
+	while (g_hash_table_iter_next(&iter, &key, &value)) {
+		Coverage *src_cnt = (Coverage *)value;
+		Coverage *dst_cnt = g_new0(Coverage, 1);
+		*dst_cnt = *src_cnt;
+		g_hash_table_insert(dst, key, dst_cnt);
+	}
+	return dst;
 }

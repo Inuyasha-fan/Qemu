@@ -4976,6 +4976,16 @@ SRST
         Argument passed to the plugin. (Can be given multiple times.)
 ERST
 
+DEF("fuzz", 0, QEMU_OPTION_fuzz,
+    "-fuzz             enable AFLNet fuzzing mode (snapshot forkserver)\n",
+    QEMU_ARCH_ALL)
+SRST
+``-fuzz``
+    Enable AFLNet fuzzing mode with snapshot-based forkserver.
+    This creates named pipes for communication with AFLNet
+    and shared memory for coverage bitmap.
+ERST
+
 HXCOMM Internal use
 DEF("qtest", HAS_ARG, QEMU_OPTION_qtest, "", QEMU_ARCH_ALL)
 DEF("qtest-log", HAS_ARG, QEMU_OPTION_qtest_log, "", QEMU_ARCH_ALL)

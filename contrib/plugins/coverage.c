@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <glib.h>
 #include <qemu-plugin.h>
 
@@ -27,15 +30,16 @@ static uint32_t trace_count;
 static EdgeTrace *trace_head;
 static EdgeTrace *trace_tail;
 
-static void plugin_exit(qemu_plugin_id_t id, void *p) {
-	if (!log_fp) {
-		return;
-	}
+// fuzz 模式相关
+static bool fuzz_mode;
+static uint64_t fuzz_exec_count;
+// 深度拷贝的覆盖率状态，用于第一次 fuzz 后还原
+static GHashTable *fuzz_saved_coverage_map = NULL;
+// 通知管道文件描述符
+static int fuzz_notify_fd = -1;
 
-	GHashTableIter iter;
-	gpointer key, value;
-	GList *list = NULL;
-
+// 输出覆盖率信息
+static void dump_coverage_info(void) {
 	g_mutex_lock(&lock);
 	guint count = g_hash_table_size(coverage_map);
 	g_mutex_unlock(&lock);
@@ -43,6 +47,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *p) {
 	g_info("%u TB entries collected", count);
 
 	g_mutex_lock(&lock);
+	GHashTableIter iter;
+	gpointer key, value;
+	GList *list = NULL;
 	g_hash_table_iter_init(&iter, coverage_map);
 	while (g_hash_table_iter_next(&iter, &key, &value)) {
 		SortedEntry *e = g_new(SortedEntry, 1);
@@ -76,7 +83,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p) {
 			);
 		}
 	}
-
 	g_list_free_full(list, g_free);
 	g_mutex_unlock(&lock);
 
@@ -98,11 +104,28 @@ static void plugin_exit(qemu_plugin_id_t id, void *p) {
 			);
 		}
 	}
+}
+
+static void plugin_exit(qemu_plugin_id_t id, void *p) {
+	// 输出最后一次覆盖率信息（无论是否 fuzz 模式）
+	dump_coverage_info();
 
 	while (trace_head) {
 		EdgeTrace *t = trace_head;
 		trace_head = t->next;
 		g_free(t);
+	}
+
+	// 释放深度拷贝的 coverage_map
+	if (fuzz_saved_coverage_map) {
+		g_hash_table_destroy(fuzz_saved_coverage_map);
+		fuzz_saved_coverage_map = NULL;
+	}
+
+	// 关闭通知管道
+	if (fuzz_notify_fd >= 0) {
+		close(fuzz_notify_fd);
+		fuzz_notify_fd = -1;
 	}
 
 	fclose(log_fp);
@@ -111,6 +134,55 @@ static void plugin_exit(qemu_plugin_id_t id, void *p) {
 
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata) {
 	uint64_t virt_addr = (uint64_t)(uintptr_t)udata;
+
+	// fuzz 模式：检测入口函数执行，通知 forkserver
+	if (virt_addr == entry_info.addr && fuzz_mode) {
+		if (fuzz_exec_count > 0) {
+			// 输出上一轮 fuzz 信息
+			dump_coverage_info();
+
+			// 还原覆盖率状态到第一次 fuzz 时的状态
+			g_mutex_lock(&lock);
+			g_hash_table_remove_all(coverage_map);
+			GHashTable *tmp = deep_copy_coverage_map(fuzz_saved_coverage_map);
+			g_hash_table_destroy(coverage_map);
+			coverage_map = tmp;
+			g_mutex_unlock(&lock);
+
+			memset(edge_map, 0, sizeof(edge_map));
+			edge_count = 0;
+			trace_count = 0;
+			prev_loc_exec = 0;
+
+			// 清空执行轨迹
+			while (trace_head) {
+				EdgeTrace *t = trace_head;
+				trace_head = t->next;
+				g_free(t);
+			}
+			trace_head = NULL;
+			trace_tail = NULL;
+		} else {
+			// 第一次 fuzz：深度拷贝当前覆盖率状态
+			fuzz_saved_coverage_map = deep_copy_coverage_map(coverage_map);
+			// 通知 forkserver，只需要保存一次快照
+			fuzz_notify_fd = open(FUZZ_NOTIFY_PIPE, O_WRONLY);
+			if (fuzz_notify_fd < 0) {
+				g_error("fuzz mode: failed to open notify pipe");
+				return;
+			}
+			char buf[4] = "FORK";
+			if (write(fuzz_notify_fd, buf, 4) == 4) {
+				g_info("fuzz mode: notification sent to forkserver");
+			} else {
+				g_error("fuzz mode: failed to write notify pipe");
+				return;
+			}
+		}
+
+		fuzz_exec_count++;
+		g_info("fuzz mode: _start executing (count=%lu), notifying forkserver", fuzz_exec_count);
+	}
 
 	g_mutex_lock(&lock);
 	Coverage *cnt = (Coverage *)g_hash_table_lookup(coverage_map, (gconstpointer)(uintptr_t)virt_addr);
@@ -320,6 +392,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
 
 	if (elf_path) {
 		g_free(elf_path);
+	}
+
+	// 从 JSON 配置中读取 fuzz 字段
+	fuzz_mode = entry_info.fuzz;
+	if (fuzz_mode) {
+		g_info("fuzz mode enabled, waiting for _start execution to trigger forkserver");
 	}
 
 	g_info("inst_ratio: %" PRIu32, entry_info.inst_ratio);

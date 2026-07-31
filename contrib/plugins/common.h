@@ -9,6 +9,9 @@
 #define ENTRY_INSTR_COUNT 8
 #define EDGE_MAP_SIZE     65536
 
+// 插件通知主线程的管道路径
+#define FUZZ_NOTIFY_PIPE "/tmp/qemu_fuzz_notify"
+
 typedef struct {
 	uint64_t phys_addr;   // 物理地址，-1 表示未映射
 	uint64_t trans_count; // 翻译次数
@@ -36,6 +39,7 @@ typedef struct {
 	size_t instr_count;                         // 入口指令条数
 	uint32_t inst_ratio;                        // 边覆盖采样比例，0 表示 100%
 	bool debug;                                  // 是否输出 g_debug 日志
+	bool fuzz;                                   // 是否启用 fuzz 模式
 } ElfEntryInfo;
 
 typedef enum {
@@ -56,5 +60,9 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 void instrs_to_bytes(const ElfEntryInfo *info, uint8_t buf[ENTRY_INSTR_COUNT * 4]);
 
 uint64_t try_identify_target(const ElfEntryInfo *info, uint64_t asid, uint64_t phys);
+
+// fuzz 相关函数
+// 深度拷贝 coverage_map
+GHashTable *deep_copy_coverage_map(GHashTable *src);
 
 #endif
