@@ -2,6 +2,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/shm.h>
 #include <glib.h>
 #include <qemu-plugin.h>
 
@@ -441,4 +442,21 @@ GHashTable *deep_copy_coverage_map(GHashTable *src) {
 		g_hash_table_insert(dst, key, dst_cnt);
 	}
 	return dst;
+}
+
+// 初始化共享内存，返回共享内存指针
+uint8_t *fuzz_init_shm(void) {
+	int shmid = shmget(FUZZ_SHM_KEY, EDGE_MAP_SIZE, IPC_CREAT | 0666);
+	if (shmid < 0) {
+		g_warning("shmget failed");
+		return NULL;
+	}
+	uint8_t *ptr = (uint8_t *)shmat(shmid, NULL, 0);
+	if (ptr == (void *)-1) {
+		g_warning("shmat failed");
+		return NULL;
+	}
+	memset(ptr, 0, EDGE_MAP_SIZE);
+	g_info("shared memory initialized at key 0x%x", FUZZ_SHM_KEY);
+	return ptr;
 }

@@ -5,14 +5,9 @@
 #include "migration/snapshot.h"
 #include "fuzz/forkserver.h"
 
-#include <sys/shm.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-
-// 全局变量定义
-static void *fuzz_shm_ptr;
-static int fuzz_forkserver_count;
 
 // 内部变量
 static FILE *log_fp;
@@ -20,6 +15,7 @@ static const char *log_path = "Logs/forkserver.log";
 static int fuzz_ctl_fd = -1;
 static int fuzz_st_fd = -1;
 static int fuzz_notify_fd = -1;
+static int fuzz_forkserver_count = 0;
 
 // 日志处理函数
 static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *message, gpointer fp) {
@@ -58,22 +54,6 @@ static void fuzz_init_log(void) {
 			log_fp
 		);
 	}
-}
-
-// 初始化 forkserver 共享内存
-static void fuzz_init_shm(void) {
-	int shmid = shmget(FUZZ_SHM_KEY, FUZZ_SHM_SIZE, IPC_CREAT | 0666);
-	if (shmid < 0) {
-		g_error("shmget failed");
-		return;
-	}
-	fuzz_shm_ptr = shmat(shmid, NULL, 0);
-	if (fuzz_shm_ptr == (void *)-1) {
-		g_error("shmat failed");
-		fuzz_shm_ptr = NULL;
-		return;
-	}
-	memset(fuzz_shm_ptr, 0, FUZZ_SHM_SIZE);
 }
 
 // 初始化 forkserver 管道
@@ -115,10 +95,6 @@ static void fuzz_cleanup(void) {
 		close(fuzz_notify_fd);
 		fuzz_notify_fd = -1;
 	}
-	if (fuzz_shm_ptr) {
-		shmdt(fuzz_shm_ptr);
-		fuzz_shm_ptr = NULL;
-	}
 	unlink(FUZZ_CTL_PIPE);
 	unlink(FUZZ_ST_PIPE);
 	unlink(FUZZ_NOTIFY_PIPE);
@@ -130,7 +106,7 @@ static void fuzz_cleanup(void) {
 }
 
 // forkserver 主循环
-void fuzz_forkserver_loop(void) {
+static void fuzz_forkserver_loop(void) {
 	g_info("waiting for AFLNet on %s", FUZZ_CTL_PIPE);
 
 	fuzz_ctl_fd = open(FUZZ_CTL_PIPE, O_RDONLY);
@@ -157,9 +133,6 @@ void fuzz_forkserver_loop(void) {
 			fuzz_forkserver_count++;
 			g_info("received test command #%d", fuzz_forkserver_count);
 
-			if (fuzz_shm_ptr) {
-				memset(fuzz_shm_ptr, 0, FUZZ_SHM_SIZE);
-			}
 			Error *err = NULL;
 			if (!load_snapshot("fuzz_snapshot", NULL, false, NULL, &err)) {
 				g_error("load_snapshot failed");
@@ -210,7 +183,6 @@ static void fuzz_pipe_handler(void *opaque) {
 void fuzz_set_enabled(bool enabled) {
 	if (enabled) {
 		fuzz_init_log();
-		fuzz_init_shm();
 		fuzz_init_pipes();
 		qemu_set_fd_handler(fuzz_notify_fd, fuzz_pipe_handler, NULL, NULL);
 		g_info("enabled, notify pipe at %s", FUZZ_NOTIFY_PIPE);

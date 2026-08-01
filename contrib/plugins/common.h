@@ -11,6 +11,8 @@
 
 // 插件通知主线程的管道路径
 #define FUZZ_NOTIFY_PIPE "/tmp/qemu_fuzz_notify"
+// 共享内存 key
+#define FUZZ_SHM_KEY 0x2000
 
 typedef struct {
 	uint64_t phys_addr;   // 物理地址，-1 表示未映射
@@ -64,5 +66,8 @@ uint64_t try_identify_target(const ElfEntryInfo *info, uint64_t asid, uint64_t p
 // fuzz 相关函数
 // 深度拷贝 coverage_map
 GHashTable *deep_copy_coverage_map(GHashTable *src);
+
+// 初始化共享内存，返回共享内存指针
+uint8_t *fuzz_init_shm(void);
 
 #endif

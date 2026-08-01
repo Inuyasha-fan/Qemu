@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/shm.h>
 #include <glib.h>
 #include <qemu-plugin.h>
 
@@ -16,7 +17,8 @@ static bool do_inline;
 static int mode = -1;
 static GMutex lock;
 static GHashTable *coverage_map;
-static uint8_t edge_map[EDGE_MAP_SIZE];
+// 共享内存指针（取代 edge_map，用于 AFLNet 读取覆盖率）
+static uint8_t *edge_map = NULL;
 static uint32_t edge_count;
 static FILE *log_fp;
 static const char *log_path = "Logs/coverage.log";
@@ -128,6 +130,12 @@ static void plugin_exit(qemu_plugin_id_t id, void *p) {
 		fuzz_notify_fd = -1;
 	}
 
+	// 分离共享内存
+	if (edge_map) {
+		shmdt(edge_map);
+		edge_map = NULL;
+	}
+
 	fclose(log_fp);
 	log_fp = NULL;
 }
@@ -149,7 +157,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata) {
 			coverage_map = tmp;
 			g_mutex_unlock(&lock);
 
-			memset(edge_map, 0, sizeof(edge_map));
+			// 清空共享内存
+			if (edge_map) {
+				memset(edge_map, 0, EDGE_MAP_SIZE);
+			}
 			edge_count = 0;
 			trace_count = 0;
 			prev_loc_exec = 0;
@@ -331,7 +342,13 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
 	}
 
 	coverage_map = g_hash_table_new(NULL, g_direct_equal);
-	memset(edge_map, 0, sizeof(edge_map));
+
+	// 初始化共享内存（所有模式都使用共享内存作为 edge_map）
+	edge_map = fuzz_init_shm();
+	if (!edge_map) {
+		g_error("failed to initialize shared memory");
+		return -1;
+	}
 
 	g_mkdir_with_parents("Logs", 0755);
 	log_fp = fopen(log_path, "a");
