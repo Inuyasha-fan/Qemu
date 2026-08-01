@@ -318,6 +318,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc, char **argv) {
 	is_system = info->system_emulation;
+	fuzz_mode = info->fuzz_mode;
 
 	char *config_path = NULL;
 	for (int i = 0; i < argc; i++) {
@@ -411,8 +412,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
 		g_free(elf_path);
 	}
 
-	// 从 JSON 配置中读取 fuzz 字段
-	fuzz_mode = entry_info.fuzz;
 	if (fuzz_mode) {
 		g_info("fuzz mode enabled, waiting for _start execution to trigger forkserver");
 	}

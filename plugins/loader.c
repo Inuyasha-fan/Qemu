@@ -37,6 +37,14 @@
 
 #include "plugin.h"
 
+// fuzz 模式全局变量
+static bool plugin_fuzz_mode = false;
+
+// 设置 fuzz 模式
+void qemu_plugin_set_fuzz_mode(bool enabled) {
+    plugin_fuzz_mode = enabled;
+}
+
 /*
  * For convenience we use a bitmap for plugin.mask, but really all we need is a
  * u32, which is what we store in TranslationBlock.
@@ -295,6 +303,7 @@ int qemu_plugin_load_list(QemuPluginList *head, Error **errp)
     info->target_name = TARGET_NAME;
     info->version.min = QEMU_PLUGIN_MIN_VERSION;
     info->version.cur = QEMU_PLUGIN_VERSION;
+    info->fuzz_mode = plugin_fuzz_mode;
 #ifndef CONFIG_USER_ONLY
     MachineState *ms = MACHINE(qdev_get_machine());
     info->system_emulation = true;

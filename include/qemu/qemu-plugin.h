@@ -74,6 +74,8 @@ typedef struct qemu_info_t {
     } version;
     /** @system_emulation: is this a full system emulation? */
     bool system_emulation;
+    /** @fuzz_mode: is fuzz mode enabled? */
+    bool fuzz_mode;
     union {
         /** @system: information relevant to system emulation */
         struct {

@@ -41,7 +41,6 @@ typedef struct {
 	size_t instr_count;                         // 入口指令条数
 	uint32_t inst_ratio;                        // 边覆盖采样比例，0 表示 100%
 	bool debug;                                  // 是否输出 g_debug 日志
-	bool fuzz;                                   // 是否启用 fuzz 模式
 } ElfEntryInfo;
 
 typedef enum {

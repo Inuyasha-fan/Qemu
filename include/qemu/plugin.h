@@ -52,6 +52,7 @@ static inline void qemu_plugin_add_opts(void)
 
 void qemu_plugin_opt_parse(const char *optstr, QemuPluginList *head);
 int qemu_plugin_load_list(QemuPluginList *head, Error **errp);
+void qemu_plugin_set_fuzz_mode(bool enabled);
 
 union qemu_plugin_cb_sig {
     qemu_plugin_simple_cb_t          simple;

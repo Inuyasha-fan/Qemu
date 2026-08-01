@@ -3497,6 +3497,7 @@ void qemu_init(int argc, char **argv)
                 break;
             case QEMU_OPTION_fuzz:
                 fuzz_set_enabled(true);
+                qemu_plugin_set_fuzz_mode(true);
                 break;
             case QEMU_OPTION_readconfig:
                 qemu_read_config_file(optarg, qemu_parse_config_group, &error_fatal);

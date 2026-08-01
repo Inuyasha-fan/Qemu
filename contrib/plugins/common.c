@@ -188,8 +188,6 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 			info->inst_ratio = (uint32_t)g_ascii_strtoull(val, NULL, 10);
 		} else if (g_strcmp0(key, "debug") == 0) {
 			info->debug = (g_strcmp0(val, "true") == 0 || g_strcmp0(val, "1") == 0);
-		} else if (g_strcmp0(key, "fuzz") == 0) {
-			info->fuzz = (g_strcmp0(val, "true") == 0 || g_strcmp0(val, "1") == 0);
 		} else if (g_strcmp0(key, "entry_code") == 0) {
 			in_list = TRUE;
 			list_count = 0;
