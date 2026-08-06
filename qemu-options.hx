@@ -4976,8 +4976,9 @@ SRST
         Argument passed to the plugin. (Can be given multiple times.)
 ERST
 
-DEF("fuzz", 0, QEMU_OPTION_fuzz,
-    "-fuzz             enable AFLNet fuzzing mode (snapshot forkserver)\n",
+DEF("fuzz", HAS_ARG, QEMU_OPTION_fuzz,
+    "-fuzz [debug]    enable AFLNet fuzzing mode (snapshot forkserver)\n"
+    "                 pass 'debug' to enable debug-level logging\n",
     QEMU_ARCH_ALL)
 SRST
 ``-fuzz``

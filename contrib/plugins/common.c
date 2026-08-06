@@ -9,14 +9,6 @@
 #include "elf.h"
 #include "common.h"
 
-gint cmp_virt_addr(gconstpointer a, gconstpointer b) {
-	const SortedEntry *ea = a;
-	const SortedEntry *eb = b;
-	if (ea->virt_addr < eb->virt_addr) return -1;
-	if (ea->virt_addr > eb->virt_addr) return 1;
-	return 0;
-}
-
 static inline uint16_t be16(uint16_t x) { return __builtin_bswap16(x); }
 static inline uint32_t be32(uint32_t x) { return __builtin_bswap32(x); }
 static inline uint64_t be64(uint64_t x) { return __builtin_bswap64(x); }
@@ -45,23 +37,6 @@ void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *message
 	fflush((FILE *)fp);
 }
 
-uint64_t coverage_hash(uint64_t vaddr, uint64_t icount, uint64_t asid, uint64_t paddr) {
-	uint64_t h = vaddr;
-	h ^= icount;
-	h = (h << 31) | (h >> 33);
-	h ^= asid;
-	h = ~h;
-	h = (h << 27) | (h >> 37);
-	h ^= paddr;
-	h &= 0x7fffffffffffffffULL;
-	h ^= h >> 33;
-	h *= 0xff51afd7ed558ccdULL;
-	h ^= h >> 33;
-	h *= 0xc4ceb9fe1a85ec53ULL;
-	h ^= h >> 33;
-	return h;
-}
-
 void instrs_to_bytes(const ElfEntryInfo *info, uint8_t buf[ENTRY_INSTR_COUNT * 4]) {
 	for (size_t i = 0; i < ENTRY_INSTR_COUNT; i++) {
 		uint32_t v = info->instrs[i];
@@ -84,7 +59,7 @@ static void bytes_to_instrs(uint8_t *buf, size_t len, ElfEntryInfo *info) {
 	}
 }
 
-// 解析 JSON 配置文件，返回 mode 及 ELF 路径，剩余字段填入 info
+// 解析 JSON 配置文件
 ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_out, int *mode_out) {
 	g_autofree char *content = NULL;
 	gsize len;
@@ -100,7 +75,6 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 		*mode_out = -1;
 	}
 
-	// 简化 JSON 解析：按行处理 key-value 对
 	g_auto(GStrv) lines = g_strsplit(content, "\n", 0);
 	int list_count = 0;
 	gboolean in_list = FALSE;
@@ -109,13 +83,11 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 		g_autofree char *raw_line = g_strdup(lines[i]);
 		char *line = g_strstrip(raw_line);
 
-		// 跳过空行、注释和纯符号行
 		if (line[0] == '\0' || line[0] == '/' || line[0] == '#'
 			|| line[0] == '{' || line[0] == '}') {
 			continue;
 		}
 
-		// 列表项处理
 		if (in_list) {
 			if (line[0] == '"') {
 				const char *val = line + 1;
@@ -133,7 +105,6 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 			in_list = FALSE;
 		}
 
-		// 解析 key: value 对
 		g_auto(GStrv) kv = g_strsplit(line, ":", 2);
 		if (!kv[0] || !kv[1]) {
 			continue;
@@ -143,7 +114,6 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 		char *key = g_strstrip(key_raw);
 		char *val = g_strstrip(val_raw);
 
-		// 去除 key 的引号
 		if (key[0] == '"') {
 			key++;
 		}
@@ -152,7 +122,6 @@ ParseResult parse_config(const char *path, ElfEntryInfo *info, char **elf_path_o
 			key[klen - 1] = '\0';
 		}
 
-		// 去除 val 的引号和尾逗号
 		size_t vlen = strlen(val);
 		if (vlen > 0 && val[vlen - 1] == ',') {
 			val[--vlen] = '\0';
@@ -247,7 +216,6 @@ ParseResult parse_elf(const char *path, ElfEntryInfo *info) {
 
 	uint64_t start_addr = ehdr_entry;
 
-	// 查找 _start 符号
 	for (uint32_t i = 0; i < ehdr_shnum; i++) {
 		uint32_t sh_type;
 		uint64_t sh_offset, sh_size, sh_link;
@@ -326,7 +294,6 @@ ParseResult parse_elf(const char *path, ElfEntryInfo *info) {
 
 	info->addr = start_addr;
 
-	// 找 .text 节
 	uint64_t shstr_off = 0;
 	if (is_64) {
 		Elf64_Shdr shdr;
@@ -370,7 +337,6 @@ ParseResult parse_elf(const char *path, ElfEntryInfo *info) {
 		}
 	}
 
-	// 读入口处机器码
 	for (uint32_t i = 0; i < ehdr_phnum; i++) {
 		uint32_t p_type;
 		uint64_t p_offset, p_vaddr, p_filesz;
@@ -427,34 +393,71 @@ uint64_t try_identify_target(const ElfEntryInfo *info, uint64_t asid, uint64_t p
 	return asid;
 }
 
-// 深度拷贝 coverage_map
-GHashTable *deep_copy_coverage_map(GHashTable *src) {
-	GHashTable *dst = g_hash_table_new(NULL, g_direct_equal);
-	GHashTableIter iter;
-	gpointer key, value;
-	g_hash_table_iter_init(&iter, src);
-	while (g_hash_table_iter_next(&iter, &key, &value)) {
-		Coverage *src_cnt = (Coverage *)value;
-		Coverage *dst_cnt = g_new0(Coverage, 1);
-		*dst_cnt = *src_cnt;
-		g_hash_table_insert(dst, key, dst_cnt);
-	}
-	return dst;
+// 初始化三段共享内存，edge_map/cov/trace 指针写入参数，失败返回 -1
+int fuzz_init_shm(uint8_t **edge_out, FuzzShmCov **cov_out, FuzzShmTrace **trace_out) {
+	int shmid;
+
+	// edge_map
+	shmid = shmget(FUZZ_SHM_EDGE_KEY, FUZZ_SHM_EDGE_SIZE, IPC_CREAT | 0666);
+	if (shmid < 0) return -1;
+	*edge_out = (uint8_t *)shmat(shmid, NULL, 0);
+	if (*edge_out == (void *)-1) return -1;
+	memset(*edge_out, 0, FUZZ_SHM_EDGE_SIZE);
+
+	// coverage
+	shmid = shmget(FUZZ_SHM_COV_KEY, FUZZ_SHM_COV_SIZE, IPC_CREAT | 0666);
+	if (shmid < 0) return -1;
+	*cov_out = (FuzzShmCov *)shmat(shmid, NULL, 0);
+	if (*cov_out == (void *)-1) return -1;
+	memset(*cov_out, 0, FUZZ_SHM_COV_SIZE);
+
+	// trace
+	shmid = shmget(FUZZ_SHM_TRACE_KEY, FUZZ_SHM_TRACE_SIZE, IPC_CREAT | 0666);
+	if (shmid < 0) return -1;
+	*trace_out = (FuzzShmTrace *)shmat(shmid, NULL, 0);
+	if (*trace_out == (void *)-1) return -1;
+	memset(*trace_out, 0, FUZZ_SHM_TRACE_SIZE);
+
+	return 0;
 }
 
-// 初始化共享内存，返回共享内存指针
-uint8_t *fuzz_init_shm(void) {
-	int shmid = shmget(FUZZ_SHM_KEY, EDGE_MAP_SIZE, IPC_CREAT | 0666);
-	if (shmid < 0) {
-		g_warning("shmget failed");
-		return NULL;
+// 在共享内存 coverage 表中查找（开放寻址哈希）
+ShmCoverageEntry *shm_coverage_lookup(FuzzShmCov *cov, uint64_t virt_addr) {
+	uint32_t idx = (uint32_t)(virt_addr % FUZZ_MAX_TB_ENTRIES);
+	for (uint32_t i = 0; i < FUZZ_MAX_TB_ENTRIES; i++) {
+		ShmCoverageEntry *e = &cov->entries[idx];
+		if (e->virt_addr == virt_addr) {
+			return e;
+		}
+		if (e->virt_addr == 0) {
+			return NULL;
+		}
+		idx = (idx + 1) % FUZZ_MAX_TB_ENTRIES;
 	}
-	uint8_t *ptr = (uint8_t *)shmat(shmid, NULL, 0);
-	if (ptr == (void *)-1) {
-		g_warning("shmat failed");
-		return NULL;
+	return NULL;
+}
+
+// 在共享内存 coverage 表中插入（开放寻址哈希）
+ShmCoverageEntry *shm_coverage_insert(FuzzShmCov *cov, uint64_t virt_addr) {
+	uint32_t idx = (uint32_t)(virt_addr % FUZZ_MAX_TB_ENTRIES);
+	for (uint32_t i = 0; i < FUZZ_MAX_TB_ENTRIES; i++) {
+		ShmCoverageEntry *e = &cov->entries[idx];
+		if (e->virt_addr == 0 || e->virt_addr == virt_addr) {
+			e->virt_addr = virt_addr;
+			return e;
+		}
+		idx = (idx + 1) % FUZZ_MAX_TB_ENTRIES;
 	}
-	memset(ptr, 0, EDGE_MAP_SIZE);
-	g_info("shared memory initialized at key 0x%x", FUZZ_SHM_KEY);
-	return ptr;
+	return NULL;
+}
+
+// 统计 edge 数量
+uint32_t shm_edge_count(uint8_t *edge_map) {
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < EDGE_MAP_SIZE; i++) {
+		if (edge_map[i] != 0) {
+			count++;
+		}
+	}
+	return count;
 }
