@@ -549,6 +549,15 @@ static const struct SysemuCPUOps mips_sysemu_ops = {
  * NB: cannot be const, as some elements are changed for specific
  * mips hardware (see hw/mips/jazz.c).
  */
+#if !defined(CONFIG_USER_ONLY)
+static uint64_t mips_cpu_get_asid(CPUState *cs)
+{
+    CPUMIPSState *env = cpu_env(cs);
+
+    return env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+}
+#endif
+
 static const struct TCGCPUOps mips_tcg_ops = {
     .initialize = mips_tcg_init,
     .synchronize_from_tb = mips_cpu_synchronize_from_tb,
@@ -561,6 +570,7 @@ static const struct TCGCPUOps mips_tcg_ops = {
     .do_transaction_failed = mips_cpu_do_transaction_failed,
     .do_unaligned_access = mips_cpu_do_unaligned_access,
     .io_recompile_replay_branch = mips_io_recompile_replay_branch,
+    .get_asid = mips_cpu_get_asid,
 #endif /* !CONFIG_USER_ONLY */
 };
 #endif /* CONFIG_TCG */

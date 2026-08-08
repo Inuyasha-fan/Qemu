@@ -1,9 +1,19 @@
+// AFLNet 快照型 forkserver
+//
+// 与 AFLNet 通过命名管道通信，通过控制管道接收命令：
+//   - 0x01：保存快照（由用户手动触发，目标程序已处于稳定状态）
+//   - 0x02：执行一轮测试（加载快照、重置覆盖率、恢复虚拟机运行）
+//   - 0x03：结束本轮测试（由 fuzzer 写入，触发拷贝到共享内存）
+// 每个命令处理完成后向状态管道写入 status（1 正常，2 错误），fuzzer 阻塞读取后才能发送下一条命令
+// 每轮测试的起止由命令 0x01/0x03 驱动，不使用任何计时器
+
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
 #include "sysemu/cpus.h"
 #include "sysemu/runstate.h"
 #include "migration/snapshot.h"
 #include "fuzz/forkserver.h"
+#include "fuzz/coverage.h"
 
 #include <inttypes.h>
 #include <sys/shm.h>
@@ -16,19 +26,12 @@ static FILE *log_fp;
 static const char *log_path = "Logs/forkserver.log";
 static int fuzz_ctl_fd = -1;
 static int fuzz_st_fd = -1;
-static int fuzz_notify_fd = -1;
+static int fuzz_auto_fd = -1;
 static int fuzz_forkserver_count = 0;
-static bool fuzz_debug = false;
+static bool fuzz_fs_enabled = false;
 
-// 三段共享内存指针
+// 共享内存（仅边覆盖 bitmap，供 AFLNet 读取）
 static uint8_t *shm_edge_map = NULL;
-static FuzzShmCov *shm_cov = NULL;
-static FuzzShmTrace *shm_trace = NULL;
-
-// 深拷贝缓冲区
-static uint8_t *edge_backup = NULL;
-static FuzzShmCov *cov_backup = NULL;
-static FuzzShmTrace *trace_backup = NULL;
 
 // 日志处理函数
 static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *message, gpointer fp) {
@@ -60,177 +63,168 @@ static void fuzz_init_log(void) {
 	g_mkdir_with_parents("Logs", 0755);
 	log_fp = fopen(log_path, "w");
 	if (log_fp) {
-		g_log_set_handler(
-			LOG_DOMAIN,
-			G_LOG_LEVEL_MASK | G_LOG_FLAG_FATAL,
-			log_handler,
-			log_fp
-		);
+		g_log_set_handler(LOG_DOMAIN, G_LOG_LEVEL_MASK | G_LOG_FLAG_FATAL, log_handler, log_fp);
 	}
 }
 
-// 初始化 forkserver 管道
-static void fuzz_init_pipes(void) {
+// 创建边覆盖共享内存（key 0x2000，与 AFLNet 约定一致）
+static void fuzz_create_shm(void) {
+	int shmid = shmget(FUZZ_SHM_EDGE_KEY, FUZZ_SHM_EDGE_SIZE, IPC_CREAT | 0666);
+	if (shmid < 0) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "shmget failed for key 0x%x", FUZZ_SHM_EDGE_KEY);
+		return;
+	}
+	shm_edge_map = (uint8_t *)shmat(shmid, NULL, 0);
+	if (shm_edge_map == (void *)-1) {
+		shm_edge_map = NULL;
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "shmat failed for key 0x%x", FUZZ_SHM_EDGE_KEY);
+		return;
+	}
+	memset(shm_edge_map, 0, FUZZ_SHM_EDGE_SIZE);
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "edge map shared memory created at key 0x%x", FUZZ_SHM_EDGE_KEY);
+}
+
+// 初始化控制/状态管道（非阻塞打开，不阻塞 QEMU 启动）
+// 返回 0 成功，-1 失败
+static int fuzz_init_pipes(void) {
 	unlink(FUZZ_CTL_PIPE);
 	if (mkfifo(FUZZ_CTL_PIPE, 0666) < 0) {
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mkfifo %s failed", FUZZ_CTL_PIPE);
-		return;
+		return -1;
 	}
 	unlink(FUZZ_ST_PIPE);
 	if (mkfifo(FUZZ_ST_PIPE, 0666) < 0) {
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mkfifo %s failed", FUZZ_ST_PIPE);
+		return -1;
+	}
+
+	// 控制管道读端以 O_RDONLY 非阻塞打开，等待 AFLNet 连接
+	fuzz_ctl_fd = open(FUZZ_CTL_PIPE, O_RDONLY | O_NONBLOCK);
+	if (fuzz_ctl_fd < 0) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "open %s failed", FUZZ_CTL_PIPE);
+		return -1;
+	}
+	// 状态管道以 O_RDWR 打开，保证无读者时也能写入
+	fuzz_st_fd = open(FUZZ_ST_PIPE, O_RDWR | O_NONBLOCK);
+	if (fuzz_st_fd < 0) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "open %s failed", FUZZ_ST_PIPE);
+		close(fuzz_ctl_fd);
+		fuzz_ctl_fd = -1;
+		return -1;
+	}
+
+	// 自动保存快照通知管道，O_RDWR 打开避免无写端时立即 EOF
+	unlink(FUZZ_AUTO_PIPE);
+	if (mkfifo(FUZZ_AUTO_PIPE, 0666) < 0) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mkfifo %s failed", FUZZ_AUTO_PIPE);
+		return -1;
+	}
+	fuzz_auto_fd = open(FUZZ_AUTO_PIPE, O_RDWR | O_NONBLOCK);
+	if (fuzz_auto_fd < 0) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "open %s failed", FUZZ_AUTO_PIPE);
+		return -1;
+	}
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "pipes created: ctl=%s st=%s", FUZZ_CTL_PIPE, FUZZ_ST_PIPE);
+	return 0;
+}
+
+// 保存快照并备份覆盖率状态，成功返回 true
+static bool fuzz_do_save_snapshot(void) {
+	vm_stop(RUN_STATE_SAVE_VM);
+	Error *err = NULL;
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "saving snapshot");
+	if (!save_snapshot(FUZZ_SNAPSHOT_NAME, true, NULL, false, NULL, &err)) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "save_snapshot failed");
+		return false;
+	}
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "snapshot saved: %s", FUZZ_SNAPSHOT_NAME);
+	// 输出保存快照前捕获的覆盖率
+	fuzz_coverage_dump();
+	fuzz_coverage_backup();
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage state backed up");
+	return true;
+}
+
+// 自动保存快照通知管道回调（coverage 识别到目标入口后写入）
+static void fuzz_auto_handler(void *opaque) {
+	if (fuzz_auto_fd < 0) {
 		return;
 	}
-	unlink(FUZZ_NOTIFY_PIPE);
-	if (mkfifo(FUZZ_NOTIFY_PIPE, 0666) < 0) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mkfifo %s failed", FUZZ_NOTIFY_PIPE);
+	unsigned char dummy;
+	ssize_t n = read(fuzz_auto_fd, &dummy, 1);
+	if (n == 0) {
+		// 对端关闭，注销 handler 避免持续空转
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "auto snapshot pipe disconnected");
+		qemu_set_fd_handler(fuzz_auto_fd, NULL, NULL, NULL);
+		close(fuzz_auto_fd);
+		fuzz_auto_fd = -1;
+		return;
+	}
+	if (n < 0) {
+		if (errno == EAGAIN) {
+			// 无数据，等待下次回调
+			return;
+		}
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "read auto pipe failed: %s", strerror(errno));
 		return;
 	}
 
-	fuzz_notify_fd = open(FUZZ_NOTIFY_PIPE, O_RDONLY | O_NONBLOCK);
-	if (fuzz_notify_fd < 0) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "open %s failed", FUZZ_NOTIFY_PIPE);
-		return;
-	}
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "notify pipe created at %s", FUZZ_NOTIFY_PIPE);
-}
-
-// 附着到插件已创建的共享内存
-static void fuzz_attach_shm(void) {
-	int shmid;
-
-	shmid = shmget(FUZZ_SHM_EDGE_KEY, FUZZ_SHM_EDGE_SIZE, 0666);
-	if (shmid >= 0) {
-		shm_edge_map = (uint8_t *)shmat(shmid, NULL, 0);
-		if (shm_edge_map == (void *)-1) shm_edge_map = NULL;
-	}
-
-	shmid = shmget(FUZZ_SHM_COV_KEY, FUZZ_SHM_COV_SIZE, 0666);
-	if (shmid >= 0) {
-		shm_cov = (FuzzShmCov *)shmat(shmid, NULL, 0);
-		if (shm_cov == (void *)-1) shm_cov = NULL;
-	}
-
-	shmid = shmget(FUZZ_SHM_TRACE_KEY, FUZZ_SHM_TRACE_SIZE, 0666);
-	if (shmid >= 0) {
-		shm_trace = (FuzzShmTrace *)shmat(shmid, NULL, 0);
-		if (shm_trace == (void *)-1) shm_trace = NULL;
-	}
-
-	if (shm_edge_map && shm_cov && shm_trace) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "attached to shared memory");
-	} else {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "failed to attach to shared memory");
-	}
-}
-
-// 深拷贝共享内存
-static void shm_deep_copy(void) {
-	if (shm_edge_map) {
-		if (!edge_backup) edge_backup = g_malloc(FUZZ_SHM_EDGE_SIZE);
-		memcpy(edge_backup, shm_edge_map, FUZZ_SHM_EDGE_SIZE);
-	}
-	if (shm_cov) {
-		if (!cov_backup) cov_backup = g_malloc(FUZZ_SHM_COV_SIZE);
-		memcpy(cov_backup, shm_cov, FUZZ_SHM_COV_SIZE);
-	}
-	if (shm_trace) {
-		if (!trace_backup) trace_backup = g_malloc(FUZZ_SHM_TRACE_SIZE);
-		memcpy(trace_backup, shm_trace, FUZZ_SHM_TRACE_SIZE);
-	}
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "shared memory deep copied");
-}
-
-// 恢复共享内存
-static void shm_restore(void) {
-	if (shm_edge_map && edge_backup)
-		memcpy(shm_edge_map, edge_backup, FUZZ_SHM_EDGE_SIZE);
-	if (shm_cov && cov_backup)
-		memcpy(shm_cov, cov_backup, FUZZ_SHM_COV_SIZE);
-	if (shm_trace && trace_backup)
-		memcpy(shm_trace, trace_backup, FUZZ_SHM_TRACE_SIZE);
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "shared memory restored");
-}
-
-// 输出覆盖率信息
-static void dump_fuzz_coverage_info(void) {
-	uint32_t tb_count = 0;
-	if (shm_cov) {
-		if (fuzz_debug) {
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_DEBUG,
-				"%s,%s,%s,%s,%s",
-				"virt_addr", "phys_addr",
-				"trans_count", "exec_count", "insn_count");
-		}
-		for (uint32_t i = 0; i < FUZZ_MAX_TB_ENTRIES; i++) {
-			ShmCoverageEntry *e = &shm_cov->entries[i];
-			if (e->virt_addr == 0) continue;
-			tb_count++;
-			if (fuzz_debug) {
-				g_log(LOG_DOMAIN, G_LOG_LEVEL_DEBUG,
-					"0x%016" PRIx64 ",0x%016" PRIx64 ","
-					"%" PRIu64 ",%" PRIu64 ",%" PRIu64,
-					e->virt_addr, e->phys_addr,
-					e->trans_count, e->exec_count, e->insn_count);
-			}
-		}
-	}
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "%u TB entries", tb_count);
-
-	uint32_t edge_count = 0;
-	if (shm_edge_map) {
-		for (uint32_t i = 0; i < EDGE_MAP_SIZE; i++) {
-			if (shm_edge_map[i] != 0) edge_count++;
-		}
-	}
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "edge coverage: %" PRIu32 " edges hit", edge_count);
-
-	uint32_t trace_total = 0;
-	if (shm_trace) {
-		if (fuzz_debug) {
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_DEBUG,
-				"%s,%s,%s",
-				"virt_addr", "cur_loc", "exec_count");
-		}
-		for (uint32_t i = 0; i < shm_trace->trace_idx; i++) {
-			ShmTraceEntry *t = &shm_trace->entries[i];
-			trace_total += t->exec_count;
-			if (fuzz_debug) {
-				g_log(LOG_DOMAIN, G_LOG_LEVEL_DEBUG,
-					"0x%016" PRIx64 ",0x%08" PRIx32 ",%" PRIu32,
-					t->virt_addr, t->cur_loc, t->exec_count);
-			}
-		}
-	}
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "execution trace: %" PRIu32 " entries, trace_idx: %" PRIu32, trace_total, shm_trace->trace_idx);
+	fuzz_do_save_snapshot();
 }
 
 // AFLNet 控制管道回调
 static void fuzz_ctl_handler(void *opaque) {
-	dump_fuzz_coverage_info();
-	shm_restore();
-
 	unsigned char cmd;
 	ssize_t n = read(fuzz_ctl_fd, &cmd, 1);
-	if (n <= 0) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "AFLNet disconnected, cleaning up");
+	if (n == 0) {
+		// AFLNet 断开，FIFO 无写端后保持可读，必须注销 handler 否则会持续空转
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "AFLNet disconnected");
 		qemu_set_fd_handler(fuzz_ctl_fd, NULL, NULL, NULL);
 		close(fuzz_ctl_fd);
 		fuzz_ctl_fd = -1;
-		close(fuzz_st_fd);
-		fuzz_st_fd = -1;
+		return;
+	}
+	if (n < 0) {
+		if (errno == EAGAIN) {
+			// 无数据，等待下次回调
+			return;
+		}
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "read ctl pipe failed: %s", strerror(errno));
 		return;
 	}
 
 	if (cmd == 0x01) {
+		// 自动保存快照模式下忽略手动 0x01 命令，不回写备份
+		if (fuzz_coverage_auto_snapshot()) {
+			uint32_t status = 1;
+			if (write(fuzz_st_fd, &status, sizeof(status)) != (ssize_t)sizeof(status)) {
+				g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "write status pipe failed");
+			}
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "auto save mode enabled, manual save command ignored");
+			return;
+		}
+		// 保存快照，由用户控制时机，目标程序已处于稳定状态
+		uint32_t status = fuzz_do_save_snapshot() ? 1 : 2;
+		if (write(fuzz_st_fd, &status, sizeof(status)) != (ssize_t)sizeof(status)) {
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "write status pipe failed");
+			return;
+		}
+		return;
+	}
+
+	if (cmd == 0x02) {
+		// 恢复到保存快照时的覆盖率状态，再恢复 VM
+		fuzz_coverage_reset();
+
 		fuzz_forkserver_count++;
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "received fuzz command #%d", fuzz_forkserver_count);
 
+		uint32_t status;
 		Error *err = NULL;
 		if (!load_snapshot(FUZZ_SNAPSHOT_NAME, NULL, false, NULL, &err)) {
 			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "load_snapshot failed");
-			uint32_t status = 1;
-			write(fuzz_st_fd, &status, 4);
+			status = 2;
+			write(fuzz_st_fd, &status, sizeof(status));
 			return;
 		}
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "snapshot restored");
@@ -238,68 +232,48 @@ static void fuzz_ctl_handler(void *opaque) {
 		vm_start();
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "vm started");
 
-		uint32_t status = 0;
-		write(fuzz_st_fd, &status, 4);
-	}
-}
-
-// 插件通知回调
-static void fuzz_pipe_handler(void *opaque) {
-	char buf[4];
-	if (read(fuzz_notify_fd, buf, 4) != 4) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "read notify pipe failed");
-		return;
-	}
-	// 验证读取的内容必须是 FORK
-	if (buf[0] != 'F' || buf[1] != 'O' || buf[2] != 'R' || buf[3] != 'K') {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "invalid notification: expected FORK");
+		status = 1;
+		if (write(fuzz_st_fd, &status, sizeof(status)) != (ssize_t)sizeof(status)) {
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "write status pipe failed");
+			return;
+		}
 		return;
 	}
 
-	Error *err = NULL;
+	if (cmd == 0x03) {
+		// 结束本轮测试，拷贝 edge bitmap 到共享内存并通知 AFLNet
+		fuzz_coverage_copy_edge_map(shm_edge_map);
 
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "saving snapshot");
-	if (!save_snapshot(FUZZ_SNAPSHOT_NAME, true, NULL, false, NULL, &err)) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "save_snapshot failed");
+		uint32_t status = 1;
+		if (write(fuzz_st_fd, &status, sizeof(status)) != (ssize_t)sizeof(status)) {
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "write status pipe failed");
+			return;
+		}
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "test #%d finished, coverage copied to shared memory", fuzz_forkserver_count);
+		fuzz_coverage_dump();
 		return;
 	}
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "snapshot saved: %s", FUZZ_SNAPSHOT_NAME);
 
-	shm_deep_copy();
-
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "waiting for AFLNet on %s", FUZZ_CTL_PIPE);
-	fuzz_ctl_fd = open(FUZZ_CTL_PIPE, O_RDONLY);
-	if (fuzz_ctl_fd < 0) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "open %s failed", FUZZ_CTL_PIPE);
-		return;
-	}
-	fuzz_st_fd = open(FUZZ_ST_PIPE, O_WRONLY);
-	if (fuzz_st_fd < 0) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "open %s failed", FUZZ_ST_PIPE);
-		close(fuzz_ctl_fd);
-		fuzz_ctl_fd = -1;
-		return;
-	}
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "AFLNet connected");
-
-	qemu_set_fd_handler(fuzz_ctl_fd, fuzz_ctl_handler, NULL, NULL);
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_WARNING, "unknown fuzz command: 0x%02x", cmd);
 }
 
 // 设置 forkserver 启用状态
 void fuzz_set_enabled(bool enabled) {
 	if (enabled) {
+		fuzz_fs_enabled = true;
 		fuzz_init_log();
-		fuzz_attach_shm();
-		fuzz_init_pipes();
-		qemu_set_fd_handler(fuzz_notify_fd, fuzz_pipe_handler, NULL, NULL);
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "enabled, notify pipe at %s", FUZZ_NOTIFY_PIPE);
+		fuzz_create_shm();
+		if (fuzz_init_pipes() < 0) {
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "pipe initialization failed, forkserver disabled");
+			return;
+		}
+		qemu_set_fd_handler(fuzz_ctl_fd, fuzz_ctl_handler, NULL, NULL);
+		qemu_set_fd_handler(fuzz_auto_fd, fuzz_auto_handler, NULL, NULL);
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "enabled, waiting for AFLNet on %s", FUZZ_CTL_PIPE);
 	}
 }
 
-// 设置 debug 日志等级
-void fuzz_set_debug(bool enabled) {
-	fuzz_debug = enabled;
-	if (enabled) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "debug logging enabled");
-	}
+// fuzz 模式是否已启用（由 -fuzz 参数触发）
+bool fuzz_enabled(void) {
+	return fuzz_fs_enabled;
 }

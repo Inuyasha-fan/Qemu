@@ -85,6 +85,7 @@
 #include "sysemu/cpus.h"
 #include "sysemu/cpu-timers.h"
 #include "fuzz/forkserver.h"
+#include "fuzz/coverage.h"
 #include "migration/colo.h"
 #include "migration/postcopy-ram.h"
 #include "sysemu/kvm.h"
@@ -3497,10 +3498,7 @@ void qemu_init(int argc, char **argv)
                 break;
             case QEMU_OPTION_fuzz:
                 fuzz_set_enabled(true);
-                qemu_plugin_set_fuzz_mode(true);
-                if (optarg && strcmp(optarg, "debug") == 0) {
-                    fuzz_set_debug(true);
-                }
+                fuzz_coverage_init(optarg);
                 break;
             case QEMU_OPTION_readconfig:
                 qemu_read_config_file(optarg, qemu_parse_config_group, &error_fatal);

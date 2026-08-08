@@ -4977,14 +4977,15 @@ SRST
 ERST
 
 DEF("fuzz", HAS_ARG, QEMU_OPTION_fuzz,
-    "-fuzz [debug]    enable AFLNet fuzzing mode (snapshot forkserver)\n"
-    "                 pass 'debug' to enable debug-level logging\n",
+    "-fuzz <config.json>  enable AFLNet fuzzing mode (snapshot forkserver)\n"
+    "                 config.json specifies mode/elf_path/debug etc.\n",
     QEMU_ARCH_ALL)
 SRST
-``-fuzz``
+``-fuzz config.json``
     Enable AFLNet fuzzing mode with snapshot-based forkserver.
     This creates named pipes for communication with AFLNet
-    and shared memory for coverage bitmap.
+    and shared memory for the coverage bitmap.
+    The JSON config file specifies the coverage mode and target info.
 ERST
 
 HXCOMM Internal use

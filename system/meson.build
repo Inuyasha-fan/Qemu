@@ -37,3 +37,4 @@ system_ss.add(when: 'CONFIG_LINUX', if_true: files('async-teardown.c'))
 
 # AFLNet fuzz forkserver
 system_ss.add(files('../fuzz/forkserver.c'))
+system_ss.add(files('../fuzz/coverage.c'))

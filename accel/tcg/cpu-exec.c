@@ -35,6 +35,10 @@
 #endif
 #include "sysemu/cpus.h"
 #include "exec/cpu-all.h"
+#if !defined(CONFIG_USER_ONLY)
+#include "fuzz/coverage.h"
+#include "fuzz/forkserver.h"
+#endif
 #include "sysemu/cpu-timers.h"
 #include "exec/replay-core.h"
 #include "sysemu/tcg.h"
@@ -164,6 +168,11 @@ uint32_t curr_cflags(CPUState *cpu)
         cflags |= CF_NO_GOTO_TB | 1;
     } else if (qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN)) {
         cflags |= CF_NO_GOTO_TB;
+#if !defined(CONFIG_USER_ONLY)
+    } else if (fuzz_enabled()) {
+        /* 覆盖率采集要求每个 TB 执行都经过 cpu_tb_exec 出口 */
+        cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR;
+#endif
     }
 
     return cflags;
@@ -494,6 +503,26 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
             }
         }
     }
+
+#if !defined(CONFIG_USER_ONLY)
+    /* 覆盖率采集：TB 实际执行后记录（tb_exit 0/1 表示已执行，last_tb 为 NULL 时回退到 itb） */
+    if (fuzz_enabled() && *tb_exit <= TB_EXIT_IDX1) {
+        TranslationBlock *fuzz_tb = last_tb ? last_tb : itb;
+        uint64_t fuzz_asid = 0;
+        CPUClass *fuzz_cc = CPU_GET_CLASS(cpu);
+
+        if (fuzz_cc->tcg_ops->get_asid) {
+            fuzz_asid = fuzz_cc->tcg_ops->get_asid(cpu);
+        }
+
+        uint64_t fuzz_phys = tb_page_addr0(fuzz_tb);
+        if (fuzz_phys != (uint64_t)-1) {
+            fuzz_phys |= fuzz_tb->pc & ~TARGET_PAGE_MASK;
+        }
+
+        fuzz_coverage_record_tb(fuzz_tb->pc, fuzz_phys, fuzz_tb->icount, fuzz_asid);
+    }
+#endif
 
     /*
      * If gdb single-step, and we haven't raised another exception,

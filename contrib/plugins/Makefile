@@ -13,7 +13,6 @@ TOP_SRC_PATH = $(SRC_PATH)/../..
 VPATH += $(SRC_PATH)
 
 NAMES :=
-NAMES += coverage
 NAMES += execlog
 NAMES += hotblocks
 NAMES += hotpages
@@ -49,9 +48,6 @@ all: $(SONAMES)
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(PLUGIN_CFLAGS) -c -o $@ $<
-
-libcoverage.so: coverage.o common.o
-	$(CC) -shared -o $@ $^ $(LDLIBS)
 
 ifeq ($(CONFIG_WIN32),y)
 lib%$(SO_SUFFIX): %.o win32_linker.o ../../plugins/libqemu_plugin_api.a

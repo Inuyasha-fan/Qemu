@@ -170,6 +170,14 @@ struct TCGCPUOps {
      */
     bool (*io_recompile_replay_branch)(CPUState *cpu,
                                        const TranslationBlock *tb);
+
+    /**
+     * @get_asid: Return the current guest ASID (address space identifier)
+     *
+     * Used by the fuzz coverage module to identify the target process
+     * in system emulation mode.  If NULL, ASID 0 is assumed.
+     */
+    uint64_t (*get_asid)(CPUState *cpu);
 #endif /* !CONFIG_USER_ONLY */
 #endif /* NEED_CPU_H */
 
