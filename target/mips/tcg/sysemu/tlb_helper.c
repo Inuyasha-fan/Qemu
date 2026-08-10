@@ -1330,7 +1330,15 @@ void mips_cpu_do_interrupt(CPUState *cs)
                          (cause << CP0Ca_EC);
         break;
     default:
-        abort();
+        /*
+         * do_interrupt 被调用时异常码不在支持列表（快照恢复/中断竞态下偶发
+         * exception_index 为 EXCP_NONE 或未知值）。abort 会使 fuzz 循环中断，
+         * 改为记录后跳过异常处理，保证 VM 继续运行。
+         */
+        // abort();
+        qemu_log_mask(CPU_LOG_INT, "%s: unsupported exception %d at PC " TARGET_FMT_lx " ignored\n",
+                      __func__, cs->exception_index, env->active_tc.PC);
+        break;
     }
     if (qemu_loglevel_mask(CPU_LOG_INT)
         && cs->exception_index != EXCP_EXT_INTERRUPT) {

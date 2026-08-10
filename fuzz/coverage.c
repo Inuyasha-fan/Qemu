@@ -6,7 +6,17 @@
 //   - 内部使用 GHashTable 存储 TB 映射、链表存储执行 trace，
 //     不再依赖固定大小的共享内存数组
 //   - 维护 AFL 兼容的边覆盖 bitmap，测试结束后由 forkserver 拷贝到共享内存
-
+//
+// 五种识别模式（FuzzConfig.mode）：
+//   - mode 0 已知入口+ELF 指纹：解析 ELF 获得入口地址、.text 范围与入口指令，
+//     仅在 entry_addr 匹配的 TB 上指纹比对识别目标，按 ASID 与虚拟 .text 范围过滤
+//   - mode 1 ASLR+ELF 自动定位：解析 ELF 获得入口指令，在每个新 TB 上指纹比对，
+//     识别后计算 ASLR 偏移并同步调整 .text 范围，按 ASID 与调整后范围过滤
+//   - mode 2 ASLR 全范围扫描：不解析 ELF，不限制 .text 范围，覆盖全部地址空间
+//   - mode 3 手动输入指纹字段：手动填入 entry_addr 与完整 entry_code，
+//     过滤方式同 mode 0
+//   - mode 4 子进程模式：手动填入指纹字段，不依赖 ASID 与 elf_path，
+//     识别后记录入口物理地址，按连续性推导出 .text 物理范围（供 exec 出的子进程使用）
 #include "qemu/osdep.h"
 #include "exec/cpu-common.h"
 #include "fuzz/coverage.h"
@@ -49,6 +59,8 @@ static int auto_snap_fd = -1;
 // 目标识别状态
 static bool target_found;
 static uint64_t target_asid;
+// mode 4 子进程模式：由入口物理地址推导的 .text 物理范围起始
+static uint64_t text_phys_start;
 // 运行时 .text 范围（ASLR 调整后）
 static uint64_t text_start;
 static uint64_t text_size;
@@ -218,6 +230,10 @@ static bool parse_config(const char *path, FuzzConfig *cfg) {
 			}
 		} else if (g_strcmp0(key, "inst_ratio") == 0) {
 			cfg->inst_ratio = (uint32_t)g_ascii_strtoull(val, NULL, 10);
+		} else if (g_strcmp0(key, "wait_snapshot_restore") == 0) {
+			cfg->wait_snapshot_restore_ms = g_ascii_strtoll(val, NULL, 10);
+		} else if (g_strcmp0(key, "wait_program_done") == 0) {
+			cfg->wait_program_done_ms = g_ascii_strtoll(val, NULL, 10);
 		} else if (g_strcmp0(key, "debug") == 0) {
 			cfg->debug = (g_strcmp0(val, "true") == 0 || g_strcmp0(val, "1") == 0);
 		} else if (g_strcmp0(key, "auto_snapshot") == 0) {
@@ -474,6 +490,12 @@ static void fuzz_identify(uint64_t virt_addr, uint64_t phys_addr, uint64_t asid)
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "ASLR offset 0x%016" PRIx64 ", text_start adjusted to 0x%016" PRIx64, offset, text_start);
 	}
 
+	// 子进程模式：入口物理地址偏移量同步到 .text 物理范围
+	if (config.mode == 4) {
+		text_phys_start = phys_addr - virt_addr + text_start;
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "entry phys 0x%016" PRIx64 ", text_phys range: 0x%016" PRIx64 "-0x%016" PRIx64, phys_addr, text_phys_start, text_phys_start + text_size);
+	}
+
 	// 自动保存快照模式：通知 forkserver 在目标入口识别后保存快照
 	if (auto_snap_fd >= 0) {
 		unsigned char notify = 0x01;
@@ -487,21 +509,32 @@ static void fuzz_identify(uint64_t virt_addr, uint64_t phys_addr, uint64_t asid)
 void fuzz_coverage_record_tb(uint64_t virt_addr, uint64_t phys_addr, uint32_t insn_count, uint64_t asid) {
 	g_mutex_lock(&lock);
 
-	// 目标已识别：按 ASID 与 .text 范围过滤
+	// 目标已识别：模式 4 按 .text 物理范围过滤，其余按 ASID 与虚拟 .text 范围过滤
 	if (target_found) {
-		if (asid != target_asid) {
-			g_mutex_unlock(&lock);
-			return;
-		}
-		if (virt_addr < text_start || virt_addr > text_start + text_size) {
-			g_mutex_unlock(&lock);
-			return;
+		if (config.mode == 4) {
+			if (virt_addr < text_start || virt_addr > text_start + text_size) {
+				g_mutex_unlock(&lock);
+				return;
+			}
+			if (phys_addr < text_phys_start || phys_addr > text_phys_start + text_size) {
+				g_mutex_unlock(&lock);
+				return;
+			}
+		} else {
+			if (asid != target_asid) {
+				g_mutex_unlock(&lock);
+				return;
+			}
+			if (virt_addr < text_start || virt_addr > text_start + text_size) {
+				g_mutex_unlock(&lock);
+				return;
+			}
 		}
 	} else if (asid == 0) {
 		// 系统模式下 ASID 0 为内核代码，不参与目标识别
 		g_mutex_unlock(&lock);
 		return;
-	} else if (config.mode == 0 || config.mode == 3) {
+	} else if (config.mode == 0 || config.mode == 3 || config.mode == 4) {
 		// 已知入口模式：仅在入口 TB 上尝试识别目标
 		if (virt_addr != config.entry_addr) {
 			g_mutex_unlock(&lock);
@@ -530,6 +563,7 @@ void fuzz_coverage_record_tb(uint64_t virt_addr, uint64_t phys_addr, uint32_t in
 			e = g_malloc0(sizeof(CoverageEntry));
 			e->virt_addr = virt_addr;
 			e->phys_addr = phys_addr;
+			e->asid = asid;
 			e->insn_count = insn_count;
 			g_hash_table_insert(tb_map, &e->virt_addr, e);
 		}
@@ -637,6 +671,16 @@ bool fuzz_coverage_auto_snapshot(void) {
 	return config.auto_snapshot;
 }
 
+// 快照恢复后到发送 status 前的等待时间（毫秒）
+int64_t fuzz_coverage_wait_snapshot_restore_ms(void) {
+	return config.wait_snapshot_restore_ms;
+}
+
+// 结束本轮测试前等待程序处理的时间（毫秒）
+int64_t fuzz_coverage_wait_program_done_ms(void) {
+	return config.wait_program_done_ms;
+}
+
 // 重置本轮测试的覆盖率数据（恢复为保存快照时的状态，无备份时全清零）
 void fuzz_coverage_reset(void) {
 	g_mutex_lock(&lock);
@@ -666,14 +710,20 @@ void fuzz_coverage_copy_edge_map(uint8_t *dst) {
 	g_mutex_unlock(&lock);
 }
 
-// 输出覆盖率信息
-void fuzz_coverage_dump(void) {
+// 输出覆盖率信息，fuzz_count 为第几次 fuzz 的覆盖率，快照刚保存未开始 fuzz 时传 0
+void fuzz_coverage_dump(uint64_t fuzz_count) {
 	g_mutex_lock(&lock);
+
+	if (fuzz_count == 0) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage captured at snapshot save, before any fuzz round");
+	} else {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage after fuzz round #%" PRIu64, fuzz_count);
+	}
 
 	if (config.cov_block) {
 		uint32_t tb_count = g_hash_table_size(tb_map);
 		if (config.debug) {
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_DEBUG, "%s,%s,%s,%s", "virt_addr", "phys_addr", "exec_count", "insn_count");
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_DEBUG, "%s,%s,%s,%s,%s", "virt_addr", "phys_addr", "asid", "exec_count", "insn_count");
 			GHashTableIter iter;
 			gpointer key, value;
 			g_hash_table_iter_init(&iter, tb_map);
@@ -682,9 +732,10 @@ void fuzz_coverage_dump(void) {
 				g_log(
 					LOG_DOMAIN,
 					G_LOG_LEVEL_DEBUG,
-					"0x%016" PRIx64 ",0x%016" PRIx64 ",%" PRIu64 ",%" PRIu64,
+					"0x%016" PRIx64 ",0x%016" PRIx64 ",0x%02" PRIx64 ",%" PRIu64 ",%" PRIu64,
 					e->virt_addr,
 					e->phys_addr,
+					e->asid,
 					e->exec_count,
 					e->insn_count
 				);
@@ -755,16 +806,22 @@ void fuzz_coverage_init(const char *config_path) {
 		config.entry_addr = 0;
 	}
 
-	// 手动指纹模式：必须提供完整 entry_code
-	if (config.mode == 3) {
+	// 手动指纹模式（3/4）：必须提供完整 entry_code
+	if (config.mode == 3 || config.mode == 4) {
 		if (config.instr_count != ENTRY_INSTR_COUNT) {
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mode 3 requires entry_code with %d instructions", ENTRY_INSTR_COUNT);
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mode %d requires entry_code with %d instructions", config.mode, ENTRY_INSTR_COUNT);
 			return;
 		}
 	}
 
-	if (config.mode < 0 || config.mode > 3) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "invalid mode %d, must be 0-3", config.mode);
+	// 子进程模式：必须提供 .text 范围用于推导物理过滤范围
+	if (config.mode == 4 && (config.text_start == 0 || config.text_size == 0)) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mode 4 requires text_start and text_size in config");
+		return;
+	}
+
+	if (config.mode < 0 || config.mode > 4) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "invalid mode %d, must be 0-4", config.mode);
 		return;
 	}
 

@@ -26,6 +26,7 @@
 typedef struct {
 	uint64_t virt_addr;  // hash key
 	uint64_t phys_addr;
+	uint64_t asid;       // 所属进程 ASID
 	uint64_t exec_count;
 	uint64_t insn_count;
 } CoverageEntry;
@@ -42,6 +43,7 @@ typedef struct FuzzTraceEntry {
 typedef struct {
 	int mode;                   // 0: 已知入口+ELF 指纹  1: ASLR+ELF 自动定位
 	                            // 2: ASLR 全范围扫描     3: 手动输入指纹字段
+	                            // 4: 子进程模式（物理地址过滤，不依赖 ASID）
 	bool debug;                 // 是否输出 debug 日志
 	bool auto_snapshot;         // 识别到目标入口后是否自动保存快照（false 时由 fuzzer 控制）
 	bool cov_block;             // 收集 block 覆盖率（TB 映射表）
@@ -54,6 +56,8 @@ typedef struct {
 	uint32_t inst_ratio;        // 边覆盖采样比例，0 表示 100%
 	uint32_t instrs[ENTRY_INSTR_COUNT];  // 入口指令，大端 uint32_t
 	size_t instr_count;         // 入口指令条数
+	int64_t wait_snapshot_restore_ms;  // 快照恢复后到发送 status 前的等待时间（毫秒，0 不等待）
+	int64_t wait_program_done_ms;      // 结束本轮测试前等待程序处理的时间（毫秒，0 不等待）
 } FuzzConfig;
 
 // 初始化覆盖率模块（解析配置、ELF，初始化数据结构）
@@ -62,13 +66,17 @@ void fuzz_coverage_init(const char *config_path);
 void fuzz_coverage_record_tb(uint64_t virt_addr, uint64_t phys_addr, uint32_t insn_count, uint64_t asid);
 // 是否开启自动保存快照（识别到目标入口后自动保存）
 bool fuzz_coverage_auto_snapshot(void);
+// 快照恢复后到发送 status 前的等待时间（毫秒）
+int64_t fuzz_coverage_wait_snapshot_restore_ms(void);
+// 结束本轮测试前等待程序处理的时间（毫秒）
+int64_t fuzz_coverage_wait_program_done_ms(void);
 // 将当前覆盖率状态深拷贝为备份（save_snapshot 成功后调用）
 void fuzz_coverage_backup(void);
 // 重置本轮测试的覆盖率数据（恢复为保存快照时的状态，无备份时全清零）
 void fuzz_coverage_reset(void);
 // 将内部 edge bitmap 拷贝到共享内存供 AFLNet 读取
 void fuzz_coverage_copy_edge_map(uint8_t *dst);
-// 输出覆盖率信息（条目级日志受配置 debug 控制）
-void fuzz_coverage_dump(void);
+// 输出覆盖率信息（fuzz_count 为第几次 fuzz 轮次，快照刚保存未开始 fuzz 时传 0）
+void fuzz_coverage_dump(uint64_t fuzz_count);
 
 #endif

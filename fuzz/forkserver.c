@@ -9,6 +9,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "sysemu/cpus.h"
 #include "sysemu/runstate.h"
 #include "migration/snapshot.h"
@@ -29,6 +30,10 @@ static int fuzz_st_fd = -1;
 static int fuzz_auto_fd = -1;
 static int fuzz_forkserver_count = 0;
 static bool fuzz_fs_enabled = false;
+
+// 延迟发送 status 的定时器（等待快照恢复 / 等待程序处理，不能阻塞主循环）
+static QEMUTimer *fuzz_restore_timer;
+static QEMUTimer *fuzz_copy_timer;
 
 // 共享内存（仅边覆盖 bitmap，供 AFLNet 读取）
 static uint8_t *shm_edge_map = NULL;
@@ -138,8 +143,8 @@ static bool fuzz_do_save_snapshot(void) {
 		return false;
 	}
 	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "snapshot saved: %s", FUZZ_SNAPSHOT_NAME);
-	// 输出保存快照前捕获的覆盖率
-	fuzz_coverage_dump();
+	// 输出保存快照前捕获的覆盖率（尚未开始 fuzz 轮次）
+	fuzz_coverage_dump(0);
 	fuzz_coverage_backup();
 	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage state backed up");
 	return true;
@@ -172,6 +177,44 @@ static void fuzz_auto_handler(void *opaque) {
 	fuzz_do_save_snapshot();
 }
 
+// 向状态管道写入 status，失败仅记录日志
+static void fuzz_write_status(uint32_t status) {
+	if (write(fuzz_st_fd, &status, sizeof(status)) != (ssize_t)sizeof(status)) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "write status pipe failed");
+	}
+}
+
+// 结束本轮测试：拷贝 edge bitmap 到共享内存并通知 AFLNet
+static void fuzz_finish_test(void) {
+	fuzz_coverage_copy_edge_map(shm_edge_map);
+
+	fuzz_write_status(1);
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "test #%d finished, coverage copied to shared memory", fuzz_forkserver_count);
+	fuzz_coverage_dump(fuzz_forkserver_count);
+}
+
+// 快照恢复等待结束，通知 fuzzer 新一轮测试可以开始
+static void fuzz_restore_timer_cb(void *opaque) {
+	fuzz_write_status(1);
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "vm ready, status sent after %" PRId64 " ms wait", fuzz_coverage_wait_snapshot_restore_ms());
+}
+
+// 程序处理等待结束，拷贝覆盖率并通知 fuzzer
+static void fuzz_copy_timer_cb(void *opaque) {
+	fuzz_finish_test();
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage copied after %" PRId64 " ms wait", fuzz_coverage_wait_program_done_ms());
+}
+
+// 懒创建延迟定时器：fuzz_set_enabled 在选项解析期执行，早于 qemu_init_timers，此时建 timer 会挂空定时器列表
+static void fuzz_timer_ensure(void) {
+	if (!fuzz_restore_timer) {
+		fuzz_restore_timer = timer_new_ns(QEMU_CLOCK_REALTIME, fuzz_restore_timer_cb, NULL);
+	}
+	if (!fuzz_copy_timer) {
+		fuzz_copy_timer = timer_new_ns(QEMU_CLOCK_REALTIME, fuzz_copy_timer_cb, NULL);
+	}
+}
+
 // AFLNet 控制管道回调
 static void fuzz_ctl_handler(void *opaque) {
 	unsigned char cmd;
@@ -196,19 +239,12 @@ static void fuzz_ctl_handler(void *opaque) {
 	if (cmd == 0x01) {
 		// 自动保存快照模式下忽略手动 0x01 命令，不回写备份
 		if (fuzz_coverage_auto_snapshot()) {
-			uint32_t status = 1;
-			if (write(fuzz_st_fd, &status, sizeof(status)) != (ssize_t)sizeof(status)) {
-				g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "write status pipe failed");
-			}
+			fuzz_write_status(1);
 			g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "auto save mode enabled, manual save command ignored");
 			return;
 		}
 		// 保存快照，由用户控制时机，目标程序已处于稳定状态
-		uint32_t status = fuzz_do_save_snapshot() ? 1 : 2;
-		if (write(fuzz_st_fd, &status, sizeof(status)) != (ssize_t)sizeof(status)) {
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "write status pipe failed");
-			return;
-		}
+		fuzz_write_status(fuzz_do_save_snapshot() ? 1 : 2);
 		return;
 	}
 
@@ -219,12 +255,10 @@ static void fuzz_ctl_handler(void *opaque) {
 		fuzz_forkserver_count++;
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "received fuzz command #%d", fuzz_forkserver_count);
 
-		uint32_t status;
 		Error *err = NULL;
 		if (!load_snapshot(FUZZ_SNAPSHOT_NAME, NULL, false, NULL, &err)) {
 			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "load_snapshot failed");
-			status = 2;
-			write(fuzz_st_fd, &status, sizeof(status));
+			fuzz_write_status(2);
 			return;
 		}
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "snapshot restored");
@@ -232,25 +266,29 @@ static void fuzz_ctl_handler(void *opaque) {
 		vm_start();
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "vm started");
 
-		status = 1;
-		if (write(fuzz_st_fd, &status, sizeof(status)) != (ssize_t)sizeof(status)) {
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "write status pipe failed");
-			return;
+		// 不能在本 handler 内 sleep 等待恢复：vm_start 要等本函数返回后才真正开始恢复虚拟机
+		// 用主循环定时器延迟发送 status，期间 vCPU 线程已恢复执行
+		int64_t wait_ms = fuzz_coverage_wait_snapshot_restore_ms();
+		if (wait_ms > 0) {
+			fuzz_timer_ensure();
+			timer_mod(fuzz_restore_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + wait_ms * (int64_t)SCALE_MS);
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "status delayed %" PRId64 " ms for vm restore", wait_ms);
+		} else {
+			fuzz_write_status(1);
 		}
 		return;
 	}
 
 	if (cmd == 0x03) {
-		// 结束本轮测试，拷贝 edge bitmap 到共享内存并通知 AFLNet
-		fuzz_coverage_copy_edge_map(shm_edge_map);
-
-		uint32_t status = 1;
-		if (write(fuzz_st_fd, &status, sizeof(status)) != (ssize_t)sizeof(status)) {
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "write status pipe failed");
-			return;
+		// 先等待程序处理完本轮输入，再拷贝 edge bitmap 到共享内存并通知 AFLNet
+		int64_t wait_ms = fuzz_coverage_wait_program_done_ms();
+		if (wait_ms > 0) {
+			fuzz_timer_ensure();
+			timer_mod(fuzz_copy_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + wait_ms * (int64_t)SCALE_MS);
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage copy delayed %" PRId64 " ms for program processing", wait_ms);
+		} else {
+			fuzz_finish_test();
 		}
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "test #%d finished, coverage copied to shared memory", fuzz_forkserver_count);
-		fuzz_coverage_dump();
 		return;
 	}
 
