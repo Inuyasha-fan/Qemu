@@ -178,6 +178,14 @@ struct TCGCPUOps {
      * in system emulation mode.  If NULL, ASID 0 is assumed.
      */
     uint64_t (*get_asid)(CPUState *cpu);
+
+    /**
+     * @is_user_mode: Return whether the guest CPU is in user mode
+     *
+     * Used by the fuzz coverage module to distinguish target-process
+     * execution from kernel execution.  If NULL, false is assumed.
+     */
+    bool (*is_user_mode)(CPUState *cpu);
 #endif /* !CONFIG_USER_ONLY */
 #endif /* NEED_CPU_H */
 

@@ -35,8 +35,9 @@ static bool fuzz_fs_enabled = false;
 static QEMUTimer *fuzz_restore_timer;
 static QEMUTimer *fuzz_copy_timer;
 
-// 共享内存（仅边覆盖 bitmap，供 AFLNet 读取）
+// 共享内存（边覆盖 bitmap 供 AFLNet 读取，退出状态供 AFLNet 读取）
 static uint8_t *shm_edge_map = NULL;
+static uint32_t *shm_exit_status = NULL;
 
 // 日志处理函数
 static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *message, gpointer fp) {
@@ -87,6 +88,23 @@ static void fuzz_create_shm(void) {
 	}
 	memset(shm_edge_map, 0, FUZZ_SHM_EDGE_SIZE);
 	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "edge map shared memory created at key 0x%x", FUZZ_SHM_EDGE_KEY);
+}
+
+// 创建退出状态共享内存（key 0x2001，与 AFLNet 约定一致）
+static void fuzz_create_exit_shm(void) {
+	int shmid = shmget(FUZZ_SHM_EXIT_KEY, FUZZ_SHM_EXIT_SIZE, IPC_CREAT | 0666);
+	if (shmid < 0) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "shmget failed for key 0x%x", FUZZ_SHM_EXIT_KEY);
+		return;
+	}
+	shm_exit_status = (uint32_t *)shmat(shmid, NULL, 0);
+	if (shm_exit_status == (void *)-1) {
+		shm_exit_status = NULL;
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "shmat failed for key 0x%x", FUZZ_SHM_EXIT_KEY);
+		return;
+	}
+	*shm_exit_status = 0;
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "exit status shared memory created at key 0x%x", FUZZ_SHM_EXIT_KEY);
 }
 
 // 初始化控制/状态管道（非阻塞打开，不阻塞 QEMU 启动）
@@ -184,9 +202,15 @@ static void fuzz_write_status(uint32_t status) {
 	}
 }
 
-// 结束本轮测试：拷贝 edge bitmap 到共享内存并通知 AFLNet
+// 结束本轮测试：拷贝 edge bitmap 与退出状态到共享内存并通知 AFLNet
 static void fuzz_finish_test(void) {
 	fuzz_coverage_copy_edge_map(shm_edge_map);
+
+	// 目标进程退出状态（waitpid 格式），供 AFLNet 判断正常退出/崩溃
+	if (shm_exit_status) {
+		*shm_exit_status = fuzz_coverage_get_exit_status();
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "exit status 0x%08x copied to shared memory", *shm_exit_status);
+	}
 
 	fuzz_write_status(1);
 	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "test #%d finished, coverage copied to shared memory", fuzz_forkserver_count);
@@ -196,13 +220,11 @@ static void fuzz_finish_test(void) {
 // 快照恢复等待结束，通知 fuzzer 新一轮测试可以开始
 static void fuzz_restore_timer_cb(void *opaque) {
 	fuzz_write_status(1);
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "vm ready, status sent after %" PRId64 " ms wait", fuzz_coverage_wait_snapshot_restore_ms());
 }
 
 // 程序处理等待结束，拷贝覆盖率并通知 fuzzer
 static void fuzz_copy_timer_cb(void *opaque) {
 	fuzz_finish_test();
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage copied after %" PRId64 " ms wait", fuzz_coverage_wait_program_done_ms());
 }
 
 // 懒创建延迟定时器：fuzz_set_enabled 在选项解析期执行，早于 qemu_init_timers，此时建 timer 会挂空定时器列表
@@ -272,7 +294,6 @@ static void fuzz_ctl_handler(void *opaque) {
 		if (wait_ms > 0) {
 			fuzz_timer_ensure();
 			timer_mod(fuzz_restore_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + wait_ms * (int64_t)SCALE_MS);
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "status delayed %" PRId64 " ms for vm restore", wait_ms);
 		} else {
 			fuzz_write_status(1);
 		}
@@ -285,7 +306,6 @@ static void fuzz_ctl_handler(void *opaque) {
 		if (wait_ms > 0) {
 			fuzz_timer_ensure();
 			timer_mod(fuzz_copy_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + wait_ms * (int64_t)SCALE_MS);
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage copy delayed %" PRId64 " ms for program processing", wait_ms);
 		} else {
 			fuzz_finish_test();
 		}
@@ -301,6 +321,7 @@ void fuzz_set_enabled(bool enabled) {
 		fuzz_fs_enabled = true;
 		fuzz_init_log();
 		fuzz_create_shm();
+		fuzz_create_exit_shm();
 		if (fuzz_init_pipes() < 0) {
 			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "pipe initialization failed, forkserver disabled");
 			return;

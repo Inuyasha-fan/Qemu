@@ -59,6 +59,11 @@ static int auto_snap_fd = -1;
 // 目标识别状态
 static bool target_found;
 static uint64_t target_asid;
+// 目标进程退出状态（waitpid 格式：正常退出为 exit_code<<8，信号终止为信号值）
+static uint32_t exit_status;
+// 疑似故障标记：用户模式 TLB 缺失后目标进程未再执行用户态代码（可能被内核判 SIGSEGV）。
+// 需求分页成功时目标会立即恢复用户态执行，执行即清除此标记
+static bool fault_pending;
 // mode 4 子进程模式：由入口物理地址推导的 .text 物理范围起始
 static uint64_t text_phys_start;
 // 运行时 .text 范围（ASLR 调整后）
@@ -506,8 +511,13 @@ static void fuzz_identify(uint64_t virt_addr, uint64_t phys_addr, uint64_t asid)
 }
 
 // 记录一个已执行 TB 的覆盖率（主循环 TB 执行出口调用）
-void fuzz_coverage_record_tb(uint64_t virt_addr, uint64_t phys_addr, uint32_t insn_count, uint64_t asid) {
+void fuzz_coverage_record_tb(uint64_t virt_addr, uint64_t phys_addr, uint32_t insn_count, uint64_t asid, bool user_mode) {
 	g_mutex_lock(&lock);
+
+	// 目标进程用户态重新执行：上一处疑似故障已被内核需求分页解决，非致命
+	if (fault_pending && user_mode && target_found && asid == target_asid) {
+		fault_pending = false;
+	}
 
 	// 目标已识别：模式 4 按 .text 物理范围过滤，其余按 ASID 与虚拟 .text 范围过滤
 	if (target_found) {
@@ -681,9 +691,52 @@ int64_t fuzz_coverage_wait_program_done_ms(void) {
 	return config.wait_program_done_ms;
 }
 
+// 记录目标进程退出（syscall 异常时由 tlb_helper 调用）：仅捕获已识别目标的退出码，
+// waitpid 格式 status = (exit_code & 0xff) << 8
+void fuzz_coverage_record_exit(uint64_t asid, uint32_t exit_code) {
+	g_mutex_lock(&lock);
+	if (target_found && asid == target_asid) {
+		exit_status = (exit_code & 0xff) << 8;
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "target process exit captured: code=%u, status=0x%08x", exit_code, exit_status);
+	}
+	g_mutex_unlock(&lock);
+}
+
+// 记录目标进程被信号终止（waitpid 格式 status 直接存信号值，WIFSIGNALED 为真）。
+// 后到的记录覆盖先到的：进程先收到信号再正常退出（信号被捕获）时，exit 覆盖信号
+void fuzz_coverage_record_signal(uint64_t asid, uint32_t sig) {
+	g_mutex_lock(&lock);
+	if (target_found && asid == target_asid) {
+		exit_status = sig;
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "target process killed by signal %u, status=0x%08x", sig, exit_status);
+	}
+	g_mutex_unlock(&lock);
+}
+
+// 记录疑似故障（用户模式 TLB 缺失）：内核可能需求分页返回，也可能判 SIGSEGV 杀进程。
+// 裁决：目标进程后续是否恢复用户态执行（record_tb 清除标记）；0x03 拷贝时标记仍在则视为 SIGSEGV
+void fuzz_coverage_record_fault(uint64_t asid) {
+	g_mutex_lock(&lock);
+	if (target_found && asid == target_asid) {
+		fault_pending = true;
+	}
+	g_mutex_unlock(&lock);
+}
+
+// 获取目标进程退出状态（waitpid 格式；疑似故障未裁决时返回 SIGSEGV）
+uint32_t fuzz_coverage_get_exit_status(void) {
+	g_mutex_lock(&lock);
+	uint32_t status = fault_pending ? 11 : exit_status;
+	g_mutex_unlock(&lock);
+	return status;
+}
+
 // 重置本轮测试的覆盖率数据（恢复为保存快照时的状态，无备份时全清零）
 void fuzz_coverage_reset(void) {
 	g_mutex_lock(&lock);
+	// 每轮快照恢复后目标进程重新执行，退出状态必须清零
+	exit_status = 0;
+	fault_pending = false;
 	g_hash_table_destroy(tb_map);
 	free_trace(trace_head);
 	trace_head = NULL;
@@ -786,6 +839,11 @@ void fuzz_coverage_init(const char *config_path) {
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "failed to parse config: %s", config_path);
 		return;
 	}
+
+	// 等待时间配置（每轮测试的延迟行为，启动时输出一次即可）
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO,
+	      "wait configured: wait_snapshot_restore=%" PRId64 " ms, wait_program_done=%" PRId64 " ms",
+	      config.wait_snapshot_restore_ms, config.wait_program_done_ms);
 
 	// 模式 0/1：需要 elf_path 解析入口与指纹
 	if ((config.mode == 0 || config.mode == 1) && (!config.elf_path || config.elf_path[0] == '\0')) {

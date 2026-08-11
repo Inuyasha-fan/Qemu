@@ -556,6 +556,13 @@ static uint64_t mips_cpu_get_asid(CPUState *cs)
 
     return env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
 }
+
+static bool mips_cpu_is_user_mode(CPUState *cs)
+{
+    CPUMIPSState *env = cpu_env(cs);
+
+    return (env->hflags & MIPS_HFLAG_KSU) == MIPS_HFLAG_UM;
+}
 #endif
 
 static const struct TCGCPUOps mips_tcg_ops = {
@@ -571,6 +578,7 @@ static const struct TCGCPUOps mips_tcg_ops = {
     .do_unaligned_access = mips_cpu_do_unaligned_access,
     .io_recompile_replay_branch = mips_io_recompile_replay_branch,
     .get_asid = mips_cpu_get_asid,
+    .is_user_mode = mips_cpu_is_user_mode,
 #endif /* !CONFIG_USER_ONLY */
 };
 #endif /* CONFIG_TCG */

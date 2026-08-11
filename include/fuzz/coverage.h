@@ -10,6 +10,9 @@
 // 边覆盖共享内存 key（仅供 AFLNet 读取）
 #define FUZZ_SHM_EDGE_KEY 0x2000
 #define FUZZ_SHM_EDGE_SIZE sizeof(uint8_t[EDGE_MAP_SIZE])
+// 退出状态共享内存 key（waitpid 格式 status，仅供 AFLNet 读取）
+#define FUZZ_SHM_EXIT_KEY 0x2001
+#define FUZZ_SHM_EXIT_SIZE sizeof(uint32_t)
 
 // 入口指纹指令条数
 #define ENTRY_INSTR_COUNT 8
@@ -62,8 +65,16 @@ typedef struct {
 
 // 初始化覆盖率模块（解析配置、ELF，初始化数据结构）
 void fuzz_coverage_init(const char *config_path);
-// 记录一个已执行 TB 的覆盖率（由主循环 TB 执行出口调用）
-void fuzz_coverage_record_tb(uint64_t virt_addr, uint64_t phys_addr, uint32_t insn_count, uint64_t asid);
+// 记录一个已执行 TB 的覆盖率（由主循环 TB 执行出口调用，user_mode 为执行时的 guest 用户态标志）
+void fuzz_coverage_record_tb(uint64_t virt_addr, uint64_t phys_addr, uint32_t insn_count, uint64_t asid, bool user_mode);
+// 记录目标进程退出（syscall 异常时由 tlb_helper 调用，exit_code 为 a0）
+void fuzz_coverage_record_exit(uint64_t asid, uint32_t exit_code);
+// 记录目标进程被信号终止（用户模式致命异常/自杀信号，sig 为信号值）
+void fuzz_coverage_record_signal(uint64_t asid, uint32_t sig);
+// 记录目标进程疑似故障（用户模式 TLB 缺失，内核可能需求分页或判 SIGSEGV，由后续用户态执行裁决）
+void fuzz_coverage_record_fault(uint64_t asid);
+// 获取目标进程退出状态（waitpid 格式，供 forkserver 拷入共享内存）
+uint32_t fuzz_coverage_get_exit_status(void);
 // 是否开启自动保存快照（识别到目标入口后自动保存）
 bool fuzz_coverage_auto_snapshot(void);
 // 快照恢复后到发送 status 前的等待时间（毫秒）

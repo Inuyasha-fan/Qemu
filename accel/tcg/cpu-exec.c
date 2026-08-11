@@ -509,10 +509,14 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     if (fuzz_enabled() && *tb_exit <= TB_EXIT_IDX1) {
         TranslationBlock *fuzz_tb = last_tb ? last_tb : itb;
         uint64_t fuzz_asid = 0;
+        bool fuzz_user = false;
         CPUClass *fuzz_cc = CPU_GET_CLASS(cpu);
 
         if (fuzz_cc->tcg_ops->get_asid) {
             fuzz_asid = fuzz_cc->tcg_ops->get_asid(cpu);
+        }
+        if (fuzz_cc->tcg_ops->is_user_mode) {
+            fuzz_user = fuzz_cc->tcg_ops->is_user_mode(cpu);
         }
 
         uint64_t fuzz_phys = tb_page_addr0(fuzz_tb);
@@ -520,7 +524,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
             fuzz_phys |= fuzz_tb->pc & ~TARGET_PAGE_MASK;
         }
 
-        fuzz_coverage_record_tb(fuzz_tb->pc, fuzz_phys, fuzz_tb->icount, fuzz_asid);
+        fuzz_coverage_record_tb(fuzz_tb->pc, fuzz_phys, fuzz_tb->icount, fuzz_asid, fuzz_user);
     }
 #endif
 
