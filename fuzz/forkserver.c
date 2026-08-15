@@ -2,10 +2,13 @@
 //
 // 与 AFLNet 通过命名管道通信，通过控制管道接收命令：
 //   - 0x01：保存快照（由用户手动触发，目标程序已处于稳定状态）
-//   - 0x02：执行一轮测试（加载快照、重置覆盖率、恢复虚拟机运行）
-//   - 0x03：结束本轮测试（由 fuzzer 写入，触发拷贝到共享内存）
-// 每个命令处理完成后向状态管道写入 status（1 正常，2 错误），fuzzer 阻塞读取后才能发送下一条命令
-// 每轮测试的起止由命令 0x01/0x03 驱动，不使用任何计时器
+//   - 0x02：执行一轮测试（加载快照、重置覆盖率、恢复虚拟机运行，
+//            ack 在配置的 wait_snapshot_restore 毫秒后返回）
+//   - 0x03：fuzzer 发包完成后的确认（等待配置的 wait_program_done 毫秒后
+//            输出本轮终态并 ack）
+// 共享内存实时更新（边 bitmap 与退出状态），0x03 仅为收尾确认与状态输出
+
+
 
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
@@ -29,15 +32,19 @@ static int fuzz_ctl_fd = -1;
 static int fuzz_st_fd = -1;
 static int fuzz_auto_fd = -1;
 static int fuzz_forkserver_count = 0;
+// ack 定时器：vm_start() 只置运行态，VM 实际执行在主循环回调中发生，
+// handler 内不能阻塞（会挡住主循环、快照恢复永不推进），
+// 等待必须由定时器回调完成：handler 注册定时器后立即返回让出主循环
+static QEMUTimer *fuzz_ack_timer = NULL;
+static unsigned char fuzz_pending_cmd = 0;
 static bool fuzz_fs_enabled = false;
 
-// 延迟发送 status 的定时器（等待快照恢复 / 等待程序处理，不能阻塞主循环）
-static QEMUTimer *fuzz_restore_timer;
-static QEMUTimer *fuzz_copy_timer;
 
 // 共享内存（边覆盖 bitmap 供 AFLNet 读取，退出状态供 AFLNet 读取）
 static uint8_t *shm_edge_map = NULL;
 static uint32_t *shm_exit_status = NULL;
+static int fuzz_edge_shmid = -1;
+static int fuzz_exit_shmid = -1;
 
 // 日志处理函数
 static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *message, gpointer fp) {
@@ -75,12 +82,12 @@ static void fuzz_init_log(void) {
 
 // 创建边覆盖共享内存（key 0x2000，与 AFLNet 约定一致）
 static void fuzz_create_shm(void) {
-	int shmid = shmget(FUZZ_SHM_EDGE_KEY, FUZZ_SHM_EDGE_SIZE, IPC_CREAT | 0666);
-	if (shmid < 0) {
+	fuzz_edge_shmid = shmget(FUZZ_SHM_EDGE_KEY, FUZZ_SHM_EDGE_SIZE, IPC_CREAT | 0666);
+	if (fuzz_edge_shmid < 0) {
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "shmget failed for key 0x%x", FUZZ_SHM_EDGE_KEY);
 		return;
 	}
-	shm_edge_map = (uint8_t *)shmat(shmid, NULL, 0);
+	shm_edge_map = (uint8_t *)shmat(fuzz_edge_shmid, NULL, 0);
 	if (shm_edge_map == (void *)-1) {
 		shm_edge_map = NULL;
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "shmat failed for key 0x%x", FUZZ_SHM_EDGE_KEY);
@@ -92,19 +99,22 @@ static void fuzz_create_shm(void) {
 
 // 创建退出状态共享内存（key 0x2001，与 AFLNet 约定一致）
 static void fuzz_create_exit_shm(void) {
-	int shmid = shmget(FUZZ_SHM_EXIT_KEY, FUZZ_SHM_EXIT_SIZE, IPC_CREAT | 0666);
-	if (shmid < 0) {
+	fuzz_exit_shmid = shmget(FUZZ_SHM_EXIT_KEY, FUZZ_SHM_EXIT_SIZE, IPC_CREAT | 0666);
+	if (fuzz_exit_shmid < 0) {
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "shmget failed for key 0x%x", FUZZ_SHM_EXIT_KEY);
 		return;
 	}
-	shm_exit_status = (uint32_t *)shmat(shmid, NULL, 0);
+	shm_exit_status = (uint32_t *)shmat(fuzz_exit_shmid, NULL, 0);
 	if (shm_exit_status == (void *)-1) {
 		shm_exit_status = NULL;
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "shmat failed for key 0x%x", FUZZ_SHM_EXIT_KEY);
 		return;
 	}
-	*shm_exit_status = 0;
+	*shm_exit_status = FUZZ_EXIT_TIMEOUT;
 	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "exit status shared memory created at key 0x%x", FUZZ_SHM_EXIT_KEY);
+
+	// 共享内存即内部 edge bitmap / 退出状态的实时载体
+	fuzz_coverage_set_shm(shm_edge_map, shm_exit_status);
 }
 
 // 初始化控制/状态管道（非阻塞打开，不阻塞 QEMU 启动）
@@ -121,8 +131,8 @@ static int fuzz_init_pipes(void) {
 		return -1;
 	}
 
-	// 控制管道读端以 O_RDONLY 非阻塞打开，等待 AFLNet 连接
-	fuzz_ctl_fd = open(FUZZ_CTL_PIPE, O_RDONLY | O_NONBLOCK);
+	// 控制管道以 O_RDWR 打开：自身持有写端，避免无写端时立即 EOF，断开后新 fuzzer 也能重连
+	fuzz_ctl_fd = open(FUZZ_CTL_PIPE, O_RDWR | O_NONBLOCK);
 	if (fuzz_ctl_fd < 0) {
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "open %s failed", FUZZ_CTL_PIPE);
 		return -1;
@@ -202,48 +212,27 @@ static void fuzz_write_status(uint32_t status) {
 	}
 }
 
-// 结束本轮测试：拷贝 edge bitmap 与退出状态到共享内存并通知 AFLNet
-static void fuzz_finish_test(void) {
-	fuzz_coverage_copy_edge_map(shm_edge_map);
-
-	// 目标进程退出状态（waitpid 格式），供 AFLNet 判断正常退出/崩溃
-	if (shm_exit_status) {
-		*shm_exit_status = fuzz_coverage_get_exit_status();
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "exit status 0x%08x copied to shared memory", *shm_exit_status);
+// ack 定时器回调：等待期主循环正常运行（VM 持续执行），到点后完成 ack 前动作
+static void fuzz_ack_timer_cb(void *opaque) {
+	(void)opaque;
+	if (fuzz_pending_cmd == 0x03) {
+		// 0x03：程序处理窗口结束，输出本轮终态（边覆盖 + 退出状态）后 ack
+		fuzz_coverage_dump(fuzz_forkserver_count);
 	}
-
-	fuzz_write_status(1);
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "test #%d finished, coverage copied to shared memory", fuzz_forkserver_count);
-	fuzz_coverage_dump(fuzz_forkserver_count);
-}
-
-// 快照恢复等待结束，通知 fuzzer 新一轮测试可以开始
-static void fuzz_restore_timer_cb(void *opaque) {
+	fuzz_pending_cmd = 0;
 	fuzz_write_status(1);
 }
 
-// 程序处理等待结束，拷贝覆盖率并通知 fuzzer
-static void fuzz_copy_timer_cb(void *opaque) {
-	fuzz_finish_test();
-}
-
-// 懒创建延迟定时器：fuzz_set_enabled 在选项解析期执行，早于 qemu_init_timers，此时建 timer 会挂空定时器列表
-static void fuzz_timer_ensure(void) {
-	if (!fuzz_restore_timer) {
-		fuzz_restore_timer = timer_new_ns(QEMU_CLOCK_REALTIME, fuzz_restore_timer_cb, NULL);
-	}
-	if (!fuzz_copy_timer) {
-		fuzz_copy_timer = timer_new_ns(QEMU_CLOCK_REALTIME, fuzz_copy_timer_cb, NULL);
-	}
-}
+// 0x03 命令的收尾等待与状态输出见 fuzz_ctl_handler
 
 // AFLNet 控制管道回调
 static void fuzz_ctl_handler(void *opaque) {
 	unsigned char cmd;
 	ssize_t n = read(fuzz_ctl_fd, &cmd, 1);
 	if (n == 0) {
-		// AFLNet 断开，FIFO 无写端后保持可读，必须注销 handler 否则会持续空转
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "AFLNet disconnected");
+		// 理论不可达：ctl 以 O_RDWR 打开，自身持有写端，FIFO 不会 EOF。
+		// 保留为防御：若将来改回 O_RDONLY，仍须注销 handler 避免空转。
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "fuzzer disconnected");
 		qemu_set_fd_handler(fuzz_ctl_fd, NULL, NULL, NULL);
 		close(fuzz_ctl_fd);
 		fuzz_ctl_fd = -1;
@@ -275,7 +264,7 @@ static void fuzz_ctl_handler(void *opaque) {
 		fuzz_coverage_reset();
 
 		fuzz_forkserver_count++;
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "received fuzz command #%d", fuzz_forkserver_count);
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "received fuzz command %d", fuzz_forkserver_count);
 
 		Error *err = NULL;
 		if (!load_snapshot(FUZZ_SNAPSHOT_NAME, NULL, false, NULL, &err)) {
@@ -288,31 +277,67 @@ static void fuzz_ctl_handler(void *opaque) {
 		vm_start();
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "vm started");
 
-		// 不能在本 handler 内 sleep 等待恢复：vm_start 要等本函数返回后才真正开始恢复虚拟机
-		// 用主循环定时器延迟发送 status，期间 vCPU 线程已恢复执行
-		int64_t wait_ms = fuzz_coverage_wait_snapshot_restore_ms();
-		if (wait_ms > 0) {
-			fuzz_timer_ensure();
-			timer_mod(fuzz_restore_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + wait_ms * (int64_t)SCALE_MS);
-		} else {
-			fuzz_write_status(1);
+		// 注册恢复等待定时器后立即返回让出主循环（VM 才能真正执行）。
+		// 等待配置的快照恢复时间后由定时器回调 ack：等待期 guest 正在恢复，
+		// 恢复完成后目标程序即监听并处理本轮输入。
+		// 懒创建：时钟定时器列表需在主循环初始化完成后才可用
+		if (!fuzz_ack_timer) {
+			fuzz_ack_timer = timer_new_ns(QEMU_CLOCK_HOST, fuzz_ack_timer_cb, NULL);
 		}
+		fuzz_pending_cmd = cmd;
+		timer_mod(fuzz_ack_timer,
+		          qemu_clock_get_ns(QEMU_CLOCK_HOST) +
+		          (int64_t)fuzz_coverage_wait_snapshot_restore() * 1000000);
 		return;
 	}
 
 	if (cmd == 0x03) {
-		// 先等待程序处理完本轮输入，再拷贝 edge bitmap 到共享内存并通知 AFLNet
-		int64_t wait_ms = fuzz_coverage_wait_program_done_ms();
-		if (wait_ms > 0) {
-			fuzz_timer_ensure();
-			timer_mod(fuzz_copy_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + wait_ms * (int64_t)SCALE_MS);
-		} else {
-			fuzz_finish_test();
+		// fuzzer 发包完成后的确认：注册程序处理等待定时器后让出主循环
+		// （程序继续执行并实时写共享内存），到点后输出本轮终态并 ack
+		if (!fuzz_ack_timer) {
+			fuzz_ack_timer = timer_new_ns(QEMU_CLOCK_HOST, fuzz_ack_timer_cb, NULL);
 		}
+		fuzz_pending_cmd = cmd;
+		timer_mod(fuzz_ack_timer,
+		          qemu_clock_get_ns(QEMU_CLOCK_HOST) +
+		          (int64_t)fuzz_coverage_wait_program_done() * 1000000);
 		return;
 	}
 
 	g_log(LOG_DOMAIN, G_LOG_LEVEL_WARNING, "unknown fuzz command: 0x%02x", cmd);
+}
+
+// QEMU 退出时清理：删除命名管道和共享内存，避免 /tmp 与 IPC 空间残留
+// （SIGKILL 等强杀无法执行本函数，残留由下次启动时的 unlink/shmget 兜底）
+static void fuzz_cleanup(void) {
+	if (fuzz_ctl_fd >= 0) {
+		close(fuzz_ctl_fd);
+		fuzz_ctl_fd = -1;
+	}
+	if (fuzz_st_fd >= 0) {
+		close(fuzz_st_fd);
+		fuzz_st_fd = -1;
+	}
+	if (fuzz_auto_fd >= 0) {
+		close(fuzz_auto_fd);
+		fuzz_auto_fd = -1;
+	}
+	if (fuzz_ack_timer) {
+		timer_free(fuzz_ack_timer);
+		fuzz_ack_timer = NULL;
+	}
+	unlink(FUZZ_CTL_PIPE);
+	unlink(FUZZ_ST_PIPE);
+	unlink(FUZZ_AUTO_PIPE);
+	if (fuzz_edge_shmid >= 0) {
+		shmctl(fuzz_edge_shmid, IPC_RMID, NULL);
+		fuzz_edge_shmid = -1;
+	}
+	if (fuzz_exit_shmid >= 0) {
+		shmctl(fuzz_exit_shmid, IPC_RMID, NULL);
+		fuzz_exit_shmid = -1;
+	}
+	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "cleanup done: pipes and shared memory removed");
 }
 
 // 设置 forkserver 启用状态
@@ -326,9 +351,11 @@ void fuzz_set_enabled(bool enabled) {
 			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "pipe initialization failed, forkserver disabled");
 			return;
 		}
+		atexit(fuzz_cleanup);
 		qemu_set_fd_handler(fuzz_ctl_fd, fuzz_ctl_handler, NULL, NULL);
 		qemu_set_fd_handler(fuzz_auto_fd, fuzz_auto_handler, NULL, NULL);
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "enabled, waiting for AFLNet on %s", FUZZ_CTL_PIPE);
+		// ack 定时器懒创建（首个 0x02/0x03 命令时）：定时器列表须在主循环初始化完成后才可用
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "enabled, waiting for fuzzer on %s", FUZZ_CTL_PIPE);
 	}
 }
 

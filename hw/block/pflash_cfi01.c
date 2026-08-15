@@ -1034,8 +1034,10 @@ static void postload_update_cb(void *opaque, bool running, RunState state)
     PFlashCFI01 *pfl = opaque;
 
     /* This is called after bdrv_activate_all.  */
-    qemu_del_vm_change_state_handler(pfl->vmstate);
-    pfl->vmstate = NULL;
+    if (pfl->vmstate) {
+        qemu_del_vm_change_state_handler(pfl->vmstate);
+        pfl->vmstate = NULL;
+    }
 
     trace_pflash_postload_cb(pfl->name);
     pflash_update(pfl, 0, pfl->sector_len * pfl->nb_blocs);

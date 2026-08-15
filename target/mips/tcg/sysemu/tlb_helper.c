@@ -1033,23 +1033,24 @@ static inline void set_badinstr_registers(CPUMIPSState *env)
     }
 }
 
-// fuzz：用户模式异常按 QEMU user 模式 cpu_loop 的信号映射捕获目标进程崩溃。
+// fuzz：用户模式异常按 QEMU user 模式 cpu_loop 的信号映射捕获目标进程崩溃
 // 仅映射内核会杀进程的异常（TLB refill 等由内核处理返回的异常不映射，改为疑似故障机制）
+// MIPS 内核会仿真部分异常指令（rdhwr/sync/LL-SC/FPU 等），只做疑似信号标记，由 coverage 层延迟确认
 static uint32_t fuzz_exception_to_signal(int excp)
 {
     switch (excp) {
     case EXCP_AdEL:
     case EXCP_AdES:
-        return 11; /* SIGSEGV */
+        return 11; // SIGSEGV
     case EXCP_RI:
     case EXCP_CpU:
-        return 4; /* SIGILL */
+        return 4; // SIGILL
     case EXCP_OVERFLOW:
     case EXCP_FPE:
-        return 8; /* SIGFPE */
+        return 8; // SIGFPE
     case EXCP_BREAK:
     case EXCP_TRAP:
-        return 5; /* SIGTRAP */
+        return 5; // SIGTRAP
     default:
         return 0;
     }
@@ -1088,34 +1089,33 @@ void mips_cpu_do_interrupt(CPUState *cs)
         (env->hflags & MIPS_HFLAG_DM)) {
         cs->exception_index = EXCP_DINT;
     }
-    /* fuzz：捕获目标进程退出/崩溃状态（仅用户模式异常，hflags 在 set_EPC 前仍为用户态）。
-     * 快照恢复等竞态下的异常码不在映射表内，保持原行为 */
+    // fuzz：捕获目标进程退出/崩溃状态（仅用户模式异常，hflags 在 set_EPC 前仍为用户态）
+    // 快照恢复等竞态下的异常码不在映射表内，保持原行为
     if (fuzz_enabled() && (env->hflags & MIPS_HFLAG_KSU) == MIPS_HFLAG_UM) {
         uint64_t fuzz_asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
         if (cs->exception_index == EXCP_SYSCALL) {
             uint64_t sysnum = env->active_tc.gpr[2];
             if (fuzz_syscall_match(sysnum, 1) || fuzz_syscall_match(sysnum, 246)) {
-                /* exit / exit_group（全 ABI），退出码在 a0 */
+                // exit / exit_group（全 ABI），退出码在 a0
                 fuzz_coverage_record_exit(fuzz_asid, env->active_tc.gpr[4]);
-            } else if (fuzz_syscall_match(sysnum, 37) ||
-                       fuzz_syscall_match(sysnum, 158) ||
-                       fuzz_syscall_match(sysnum, 161)) {
-                /* kill/tkill/tgkill 自杀信号：捕获 SIGABRT（abort/assert 崩溃）。 */
-                if (env->active_tc.gpr[5] == 6) {
-                    fuzz_coverage_record_signal(fuzz_asid, 6);
-                }
-            }
-        } else {
-            uint32_t sig = fuzz_exception_to_signal(cs->exception_index);
-            if (sig != 0) {
-                fuzz_coverage_record_signal(fuzz_asid, sig);
-            } else if (cs->exception_index == EXCP_TLBL ||
-                       cs->exception_index == EXCP_TLBS) {
-                /* 用户模式 TLB 缺失：内核可能需求分页返回（非致命），
-                 * 也可能地址未映射判 SIGSEGV 杀进程。无法在此预知内核裁决，
-                 * 标记疑似故障，由后续用户态执行清除 */
-                fuzz_coverage_record_fault(fuzz_asid);
-            }
+			} else if (fuzz_syscall_match(sysnum, 37) ||
+			           fuzz_syscall_match(sysnum, 158) ||
+			           fuzz_syscall_match(sysnum, 161)) {
+				// kill/tkill/tgkill 自杀信号：捕获 SIGABRT（abort/assert 崩溃）
+				if (env->active_tc.gpr[5] == 6) {
+					fuzz_coverage_record_signal(fuzz_asid, 6, env->active_tc.PC);
+				}
+			}
+		} else {
+			uint32_t sig = fuzz_exception_to_signal(cs->exception_index);
+			if (sig != 0) {
+				fuzz_coverage_record_signal(fuzz_asid, sig, env->active_tc.PC);
+			} else if (cs->exception_index == EXCP_TLBL ||
+			           cs->exception_index == EXCP_TLBS) {
+				// 用户模式 TLB 缺失：内核可能需求分页返回（非致命），也可能地址未映射判 SIGSEGV 杀进程
+				// 无法在此预知内核裁决，标记疑似故障，由目标在原 PC 恢复执行确认
+				fuzz_coverage_record_fault(fuzz_asid, env->active_tc.PC);
+			}
         }
     }
     offset = 0x180;

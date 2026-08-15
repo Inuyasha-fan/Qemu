@@ -7,16 +7,14 @@
 //     不再依赖固定大小的共享内存数组
 //   - 维护 AFL 兼容的边覆盖 bitmap，测试结束后由 forkserver 拷贝到共享内存
 //
-// 五种识别模式（FuzzConfig.mode）：
-//   - mode 0 已知入口+ELF 指纹：解析 ELF 获得入口地址、.text 范围与入口指令，
-//     仅在 entry_addr 匹配的 TB 上指纹比对识别目标，按 ASID 与虚拟 .text 范围过滤
-//   - mode 1 ASLR+ELF 自动定位：解析 ELF 获得入口指令，在每个新 TB 上指纹比对，
-//     识别后计算 ASLR 偏移并同步调整 .text 范围，按 ASID 与调整后范围过滤
-//   - mode 2 ASLR 全范围扫描：不解析 ELF，不限制 .text 范围，覆盖全部地址空间
-//   - mode 3 手动输入指纹字段：手动填入 entry_addr 与完整 entry_code，
-//     过滤方式同 mode 0
-//   - mode 4 子进程模式：手动填入指纹字段，不依赖 ASID 与 elf_path，
-//     识别后记录入口物理地址，按连续性推导出 .text 物理范围（供 exec 出的子进程使用）
+// 三种识别模式（FuzzConfig.mode）：
+//   - mode 0 ELF 指纹定位 + .text 物理范围过滤：解析 ELF 获得入口地址、.text 范围与入口指令，
+//     运行时在新 TB 上指纹比对识别目标，计算 ASLR 偏移同步到 .text 范围；
+//     仅在目标 .text 物理范围内记录覆盖率，ASID 变化（上下文轮换）时跟随更新
+//   - mode 1 ELF 指纹定位 + 全范围覆盖：识别逻辑同 mode 0（同样计算偏移与 .text 物理范围），
+//     但覆盖率不限制范围，全地址空间收集；仍通过 .text 物理范围捕获 ASID 变化
+//   - mode 2 手动输入指纹字段：手动填入 entry_addr 与完整 entry_code，
+//     识别出偏移时同步增加入口与 .text 范围，过滤方式同 mode 0
 #include "qemu/osdep.h"
 #include "exec/cpu-common.h"
 #include "fuzz/coverage.h"
@@ -41,8 +39,12 @@ static FuzzTraceEntry *trace_head;
 // 执行 trace 链表尾
 static FuzzTraceEntry *trace_tail;
 static uint32_t trace_count;
-static uint8_t edge_bitmap[EDGE_MAP_SIZE];
+// edge bitmap：指针指向共享内存（fuzz_coverage_set_shm 绑定，实时可见，无需拷贝）
+static uint8_t *edge_bitmap;
 static uint32_t prev_loc_exec;
+
+// 退出状态共享内存指针（程序退出/故障时实时写入，fuzzer 直接读取）
+static uint32_t *shm_exit_status;
 
 // 快照时的覆盖率备份（每轮测试前恢复到该状态）
 static GHashTable *backup_tb_map;
@@ -64,7 +66,13 @@ static uint32_t exit_status;
 // 疑似故障标记：用户模式 TLB 缺失后目标进程未再执行用户态代码（可能被内核判 SIGSEGV）。
 // 需求分页成功时目标会立即恢复用户态执行，执行即清除此标记
 static bool fault_pending;
-// mode 4 子进程模式：由入口物理地址推导的 .text 物理范围起始
+static bool signal_pending;
+// 疑似状态的预期恢复地址：内核处理异常后恢复用户态执行的位置
+// （TLB 缺失=原 PC 重试；RI/CpU 等可仿真异常=PC+4；自杀信号=syscall 后续指令）。
+// 目标用户态执行与该地址一致才算"内核已处理"，防止目标死亡后 ASID 被内核回收
+// 复用于其他进程、其执行误清疑似状态导致崩溃漏报
+static uint64_t pending_resume_pc;
+// 目标 .text 物理范围起始（识别时由 phys-virt 位移与虚拟 .text 起始推导）
 static uint64_t text_phys_start;
 // 运行时 .text 范围（ASLR 调整后）
 static uint64_t text_start;
@@ -235,14 +243,14 @@ static bool parse_config(const char *path, FuzzConfig *cfg) {
 			}
 		} else if (g_strcmp0(key, "inst_ratio") == 0) {
 			cfg->inst_ratio = (uint32_t)g_ascii_strtoull(val, NULL, 10);
-		} else if (g_strcmp0(key, "wait_snapshot_restore") == 0) {
-			cfg->wait_snapshot_restore_ms = g_ascii_strtoll(val, NULL, 10);
-		} else if (g_strcmp0(key, "wait_program_done") == 0) {
-			cfg->wait_program_done_ms = g_ascii_strtoll(val, NULL, 10);
 		} else if (g_strcmp0(key, "debug") == 0) {
 			cfg->debug = (g_strcmp0(val, "true") == 0 || g_strcmp0(val, "1") == 0);
 		} else if (g_strcmp0(key, "auto_snapshot") == 0) {
 			cfg->auto_snapshot = (g_strcmp0(val, "true") == 0 || g_strcmp0(val, "1") == 0);
+		} else if (g_strcmp0(key, "wait_snapshot_restore") == 0) {
+			cfg->wait_snapshot_restore = (uint32_t)g_ascii_strtoull(val, NULL, 10);
+		} else if (g_strcmp0(key, "wait_program_done") == 0) {
+			cfg->wait_program_done = (uint32_t)g_ascii_strtoull(val, NULL, 10);
 		} else if (g_strcmp0(key, "entry_code") == 0) {
 			in_list = TRUE;
 			list_count = 0;
@@ -472,7 +480,10 @@ static bool parse_elf(const char *path, FuzzConfig *cfg) {
 	return true;
 }
 
-// 指纹比对：读取 guest 物理内存与入口指令字节比较，识别目标进程
+// 指纹比对：读取 guest 物理内存与入口指令字节比较，识别目标进程。
+// 匹配成功即计算 ASLR 偏移（真实虚拟入口 - 解析出的静态入口），同步修正：
+//   - .text 真实虚拟范围（仅输出参考，不参与过滤）
+//   - .text 物理范围（内核映射 phys-virt 位移恒定，过滤/捕获 ASID 变化的稳定身份）
 static void fuzz_identify(uint64_t virt_addr, uint64_t phys_addr, uint64_t asid) {
 	if (config.instr_count != ENTRY_INSTR_COUNT) {
 		return;
@@ -488,18 +499,26 @@ static void fuzz_identify(uint64_t virt_addr, uint64_t phys_addr, uint64_t asid)
 	target_asid = asid;
 	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "target process identified: ASID=0x%02" PRIx64, target_asid);
 
-	// ASLR 模式：入口地址偏移量同步到 .text 范围
-	if (config.mode == 1) {
-		uint64_t offset = virt_addr - config.entry_addr;
-		text_start += offset;
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "ASLR offset 0x%016" PRIx64 ", text_start adjusted to 0x%016" PRIx64, offset, text_start);
-	}
-
-	// 子进程模式：入口物理地址偏移量同步到 .text 物理范围
-	if (config.mode == 4) {
-		text_phys_start = phys_addr - virt_addr + text_start;
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "entry phys 0x%016" PRIx64 ", text_phys range: 0x%016" PRIx64 "-0x%016" PRIx64, phys_addr, text_phys_start, text_phys_start + text_size);
-	}
+	// 无偏移时 offset 为 0：真实入口 == 静态入口，下面计算全部退化为原值
+	uint64_t offset = virt_addr - config.entry_addr;
+	uint64_t real_entry = config.entry_addr + offset;
+	text_start += offset;
+	// .text 物理范围：偏移与 phys-virt 位移同时作用于虚拟起始
+	uint64_t text_phys_range_start = phys_addr - virt_addr + text_start;
+	text_phys_start = text_phys_range_start;
+	g_log(
+		LOG_DOMAIN,
+		G_LOG_LEVEL_INFO,
+		"ASLR offset 0x%016" PRIx64 ", real entry virt 0x%016" PRIx64
+		", text virt range: 0x%016" PRIx64 "-0x%016" PRIx64
+		", text phys range: 0x%016" PRIx64 "-0x%016" PRIx64,
+		offset,
+		real_entry,
+		text_start,
+		text_start + text_size,
+		text_phys_start,
+		text_phys_start + text_size
+	);
 
 	// 自动保存快照模式：通知 forkserver 在目标入口识别后保存快照
 	if (auto_snap_fd >= 0) {
@@ -514,54 +533,59 @@ static void fuzz_identify(uint64_t virt_addr, uint64_t phys_addr, uint64_t asid)
 void fuzz_coverage_record_tb(uint64_t virt_addr, uint64_t phys_addr, uint32_t insn_count, uint64_t asid, bool user_mode) {
 	g_mutex_lock(&lock);
 
-	// 目标进程用户态重新执行：上一处疑似故障已被内核需求分页解决，非致命
-	if (fault_pending && user_mode && target_found && asid == target_asid) {
+	// 目标进程用户态在预期恢复地址重新执行：上一处疑似故障/信号已被内核处理
+	// （需求分页、RI/CpU 仿真等），非致命。回写超时哨兵——程序仍存活，
+	// 真实状态由之后的退出/信号/新故障覆盖。
+	// 按地址精确确认：目标死亡后 ASID 可能被内核回收复用于其他进程，
+	// 仅凭 ASID 匹配会误清疑似状态；恢复地址是内核处理路径的确定性结果
+	if ((fault_pending || signal_pending) && user_mode && target_found &&
+	    asid == target_asid && virt_addr == pending_resume_pc) {
 		fault_pending = false;
+		signal_pending = false;
+		exit_status = 0;
+		if (shm_exit_status) {
+			*shm_exit_status = FUZZ_EXIT_TIMEOUT;
+		}
 	}
 
-	// 目标已识别：模式 4 按 .text 物理范围过滤，其余按 ASID 与虚拟 .text 范围过滤
-	if (target_found) {
-		if (config.mode == 4) {
-			if (virt_addr < text_start || virt_addr > text_start + text_size) {
-				g_mutex_unlock(&lock);
-				return;
-			}
-			if (phys_addr < text_phys_start || phys_addr > text_phys_start + text_size) {
-				g_mutex_unlock(&lock);
-				return;
-			}
-		} else {
-			if (asid != target_asid) {
-				g_mutex_unlock(&lock);
-				return;
-			}
-			if (virt_addr < text_start || virt_addr > text_start + text_size) {
-				g_mutex_unlock(&lock);
-				return;
-			}
-		}
-	} else if (asid == 0) {
+	// 目标未识别：每个新 TB 上尝试指纹比对（mode 0 虚入口偏移、mode 1 全范围扫描、
+	// mode 2 手动指纹都需要先定位真实入口；比对失败则本 TB 不参与）
+	if (!target_found) {
 		// 系统模式下 ASID 0 为内核代码，不参与目标识别
-		g_mutex_unlock(&lock);
-		return;
-	} else if (config.mode == 0 || config.mode == 3 || config.mode == 4) {
-		// 已知入口模式：仅在入口 TB 上尝试识别目标
-		if (virt_addr != config.entry_addr) {
+		if (asid == 0) {
 			g_mutex_unlock(&lock);
 			return;
 		}
-	} else if (config.mode == 1 || config.mode == 2) {
-		// ASLR 扫描模式：在每个新 TB 上尝试识别目标
-	} else {
-		g_mutex_unlock(&lock);
-		return;
+		if (phys_addr != (uint64_t)-1) {
+			fuzz_identify(virt_addr, phys_addr, asid);
+		}
+		if (!target_found) {
+			g_mutex_unlock(&lock);
+			return;
+		}
 	}
 
-	// 目标未识别：先在新 TB 上尝试指纹比对，失败则不记录该 TB
-	if (!target_found && phys_addr != (uint64_t)-1) {
-		fuzz_identify(virt_addr, phys_addr, asid);
+	// 识别成功后：物理范围判定 + ASID 跟随。
+	// .text 物理范围是目标二进制的稳定身份（内核映射 phys-virt 位移恒定）；
+	// 范围内 ASID 变化说明目标上下文轮换/切换，全局 ASID 跟随更新。
+	// 物理范围之外（mode 1 全范围收集时）只可能是 ASID 已失去目标身份，不重复更新。
+	bool in_text = phys_addr >= text_phys_start && phys_addr <= text_phys_start + text_size;
+	if (in_text && user_mode && asid != target_asid) {
+		g_log(
+			LOG_DOMAIN,
+			G_LOG_LEVEL_INFO,
+			"target asid re-pinned: 0x%02" PRIx64 " -> 0x%02" PRIx64 " (text tb 0x%" PRIx64 " phys 0x%" PRIx64 ")",
+			target_asid,
+			asid,
+			virt_addr,
+			phys_addr
+		);
+		target_asid = asid;
 	}
-	if (!target_found) {
+
+	// 覆盖率捕获范围：mode 0/2 仅记录 .text 物理范围内的 TB；
+	// mode 1 全范围收集（仍通过物理范围跟随 ASID）
+	if (config.mode != 1 && !in_text) {
 		g_mutex_unlock(&lock);
 		return;
 	}
@@ -681,14 +705,13 @@ bool fuzz_coverage_auto_snapshot(void) {
 	return config.auto_snapshot;
 }
 
-// 快照恢复后到发送 status 前的等待时间（毫秒）
-int64_t fuzz_coverage_wait_snapshot_restore_ms(void) {
-	return config.wait_snapshot_restore_ms;
+// 各轮等待配置 getter（forkserver 控制 0x02 ack 前 / 0x03 handler 的休眠时长）
+uint32_t fuzz_coverage_wait_snapshot_restore(void) {
+	return config.wait_snapshot_restore;
 }
 
-// 结束本轮测试前等待程序处理的时间（毫秒）
-int64_t fuzz_coverage_wait_program_done_ms(void) {
-	return config.wait_program_done_ms;
+uint32_t fuzz_coverage_wait_program_done(void) {
+	return config.wait_program_done;
 }
 
 // 记录目标进程退出（syscall 异常时由 tlb_helper 调用）：仅捕获已识别目标的退出码，
@@ -697,46 +720,64 @@ void fuzz_coverage_record_exit(uint64_t asid, uint32_t exit_code) {
 	g_mutex_lock(&lock);
 	if (target_found && asid == target_asid) {
 		exit_status = (exit_code & 0xff) << 8;
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "target process exit captured: code=%u, status=0x%08x", exit_code, exit_status);
+		if (shm_exit_status) {
+			*shm_exit_status = exit_status;
+		}
 	}
 	g_mutex_unlock(&lock);
 }
 
-// 记录目标进程被信号终止（waitpid 格式 status 直接存信号值，WIFSIGNALED 为真）。
-// 后到的记录覆盖先到的：进程先收到信号再正常退出（信号被捕获）时，exit 覆盖信号
-void fuzz_coverage_record_signal(uint64_t asid, uint32_t sig) {
+// 记录目标进程被信号终止（waitpid 格式 status 直接存信号值，WIFSIGNALED 为真）
+// 延迟确认：先标记疑似信号并写入，目标用户态在 pc+4 重新执行说明内核已处理，回写哨兵；
+// 若进程被内核杀死，不再有用户态执行，疑似状态保持到本轮 dump 上报
+void fuzz_coverage_record_signal(uint64_t asid, uint32_t sig, uint64_t pc) {
 	g_mutex_lock(&lock);
 	if (target_found && asid == target_asid) {
+		signal_pending = true;
+		pending_resume_pc = pc + 4;
 		exit_status = sig;
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "target process killed by signal %u, status=0x%08x", sig, exit_status);
+		if (shm_exit_status) {
+			*shm_exit_status = exit_status;
+		}
 	}
 	g_mutex_unlock(&lock);
 }
 
-// 记录疑似故障（用户模式 TLB 缺失）：内核可能需求分页返回，也可能判 SIGSEGV 杀进程。
-// 裁决：目标进程后续是否恢复用户态执行（record_tb 清除标记）；0x03 拷贝时标记仍在则视为 SIGSEGV
-void fuzz_coverage_record_fault(uint64_t asid) {
+// 记录疑似故障（用户模式 TLB 缺失）：内核可能需求分页返回（非致命），也可能判 SIGSEGV 杀进程
+// 立即写疑似状态 11 到共享内存；需求分页成功后目标在原 PC 重试执行，record_tb 确认后清除
+void fuzz_coverage_record_fault(uint64_t asid, uint64_t pc) {
 	g_mutex_lock(&lock);
 	if (target_found && asid == target_asid) {
 		fault_pending = true;
+		pending_resume_pc = pc;
+		exit_status = 11;
+		if (shm_exit_status) {
+			*shm_exit_status = exit_status;
+		}
 	}
 	g_mutex_unlock(&lock);
 }
 
-// 获取目标进程退出状态（waitpid 格式；疑似故障未裁决时返回 SIGSEGV）
-uint32_t fuzz_coverage_get_exit_status(void) {
+// 绑定共享内存作为实时载体：edge bitmap 直接指向共享内存，退出状态置为超时哨兵
+void fuzz_coverage_set_shm(uint8_t *edge_map, uint32_t *exit_status_shm) {
 	g_mutex_lock(&lock);
-	uint32_t status = fault_pending ? 11 : exit_status;
+	edge_bitmap = edge_map;
+	shm_exit_status = exit_status_shm;
+	*shm_exit_status = FUZZ_EXIT_TIMEOUT;
 	g_mutex_unlock(&lock);
-	return status;
 }
 
 // 重置本轮测试的覆盖率数据（恢复为保存快照时的状态，无备份时全清零）
 void fuzz_coverage_reset(void) {
 	g_mutex_lock(&lock);
-	// 每轮快照恢复后目标进程重新执行，退出状态必须清零
+	// 每轮快照恢复后目标进程重新执行，退出状态必须复原为超时哨兵（真实状态由程序退出时写入）
 	exit_status = 0;
 	fault_pending = false;
+	signal_pending = false;
+	pending_resume_pc = 0;
+	if (shm_exit_status) {
+		*shm_exit_status = FUZZ_EXIT_TIMEOUT;
+	}
 	g_hash_table_destroy(tb_map);
 	free_trace(trace_head);
 	trace_head = NULL;
@@ -746,20 +787,13 @@ void fuzz_coverage_reset(void) {
 	if (has_backup) {
 		tb_map = copy_tb_map(backup_tb_map);
 		trace_head = copy_trace(backup_trace_head, &trace_tail, &trace_count);
-		memcpy(edge_bitmap, backup_edge_bitmap, sizeof(edge_bitmap));
+		memcpy(edge_bitmap, backup_edge_bitmap, EDGE_MAP_SIZE);
 		prev_loc_exec = backup_prev_loc_exec;
 	} else {
 		tb_map = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
-		memset(edge_bitmap, 0, sizeof(edge_bitmap));
+		memset(edge_bitmap, 0, EDGE_MAP_SIZE);
 		prev_loc_exec = 0;
 	}
-	g_mutex_unlock(&lock);
-}
-
-// 将内部 edge bitmap 拷贝到共享内存供 AFLNet 读取
-void fuzz_coverage_copy_edge_map(uint8_t *dst) {
-	g_mutex_lock(&lock);
-	memcpy(dst, edge_bitmap, EDGE_MAP_SIZE);
 	g_mutex_unlock(&lock);
 }
 
@@ -770,7 +804,7 @@ void fuzz_coverage_dump(uint64_t fuzz_count) {
 	if (fuzz_count == 0) {
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage captured at snapshot save, before any fuzz round");
 	} else {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage after fuzz round #%" PRIu64, fuzz_count);
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "coverage after fuzz round %" PRIu64, fuzz_count);
 	}
 
 	if (config.cov_block) {
@@ -807,6 +841,16 @@ void fuzz_coverage_dump(uint64_t fuzz_count) {
 		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "edge coverage: %" PRIu32 " edges hit", edge_count);
 	}
 
+	// 目标退出状态（实时共享内存中的当前值，哨兵=程序本轮未退出）
+	uint32_t st = (shm_exit_status ? *shm_exit_status : exit_status);
+	if (st == FUZZ_EXIT_TIMEOUT) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "exit status: 0x%08x (timeout sentinel, program did not exit)", st);
+	} else if (st & 0x7f) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "exit status: 0x%08x (signal %u)", st, st & 0x7f);
+	} else {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "exit status: 0x%08x (exit code %u)", st, st >> 8);
+	}
+
 	if (config.cov_trace) {
 		if (config.debug) {
 			g_log(LOG_DOMAIN, G_LOG_LEVEL_DEBUG, "%s,%s,%s", "virt_addr", "cur_loc", "exec_count");
@@ -840,46 +884,26 @@ void fuzz_coverage_init(const char *config_path) {
 		return;
 	}
 
-	// 等待时间配置（每轮测试的延迟行为，启动时输出一次即可）
-	g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO,
-	      "wait configured: wait_snapshot_restore=%" PRId64 " ms, wait_program_done=%" PRId64 " ms",
-	      config.wait_snapshot_restore_ms, config.wait_program_done_ms);
-
-	// 模式 0/1：需要 elf_path 解析入口与指纹
-	if ((config.mode == 0 || config.mode == 1) && (!config.elf_path || config.elf_path[0] == '\0')) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mode %d requires elf_path in config", config.mode);
-		return;
-	}
+	// 模式 0/1：ELF 指纹自动定位（忽略手填地址字段，入口/.text 由 ELF 解析得出）
 	if (config.mode == 0 || config.mode == 1) {
+		if (!config.elf_path || config.elf_path[0] == '\0') {
+			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mode %d requires elf_path in config", config.mode);
+			return;
+		}
 		if (!parse_elf(config.elf_path, &config)) {
 			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "failed to parse ELF: %s", config.elf_path);
 			return;
 		}
 	}
 
-	// 全范围扫描模式：不过滤 .text 范围
-	if (config.mode == 2) {
-		config.text_start = 0;
-		config.text_size = UINT64_MAX;
-		config.entry_addr = 0;
-	}
-
-	// 手动指纹模式（3/4）：必须提供完整 entry_code
-	if (config.mode == 3 || config.mode == 4) {
-		if (config.instr_count != ENTRY_INSTR_COUNT) {
-			g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mode %d requires entry_code with %d instructions", config.mode, ENTRY_INSTR_COUNT);
-			return;
-		}
-	}
-
-	// 子进程模式：必须提供 .text 范围用于推导物理过滤范围
-	if (config.mode == 4 && (config.text_start == 0 || config.text_size == 0)) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mode 4 requires text_start and text_size in config");
+	// 模式 2：手动输入指纹字段，必须提供完整 entry_code
+	if (config.mode == 2 && config.instr_count != ENTRY_INSTR_COUNT) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "mode 2 requires entry_code with %d instructions", ENTRY_INSTR_COUNT);
 		return;
 	}
 
-	if (config.mode < 0 || config.mode > 4) {
-		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "invalid mode %d, must be 0-4", config.mode);
+	if (config.mode < 0 || config.mode > 2) {
+		g_log(LOG_DOMAIN, G_LOG_LEVEL_ERROR, "invalid mode %d, must be 0-2", config.mode);
 		return;
 	}
 

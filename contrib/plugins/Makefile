@@ -14,6 +14,7 @@ VPATH += $(SRC_PATH)
 
 NAMES :=
 NAMES += execlog
+NAMES += coverage
 NAMES += hotblocks
 NAMES += hotpages
 NAMES += howvec

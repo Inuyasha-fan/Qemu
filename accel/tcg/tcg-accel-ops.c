@@ -194,6 +194,17 @@ static inline void tcg_remove_all_breakpoints(CPUState *cpu)
     cpu_watchpoint_remove_all(cpu, BP_GDB);
 }
 
+// // fuzz：快照恢复（loadvm）会回退 guest TLB/RAM，但 TCG 影子 TLB 与 TB 缓存
+// // 保留加载前的陈旧翻译：上一轮遗留的虚拟页映射可能指向已改用途的物理页，
+// // 目标进程代码会从错误物理页取指，执行到垃圾字节触发伪 EXCP_RI/EXCP_CpU，
+// // 被 fuzz 层记录为 signal 4 误判崩溃。加载前冲刷全部缓存，强制按恢复后的
+// // guest TLB/RAM 重新翻译
+// static void tcg_cpu_synchronize_pre_loadvm(CPUState *cpu)
+// {
+//     tlb_flush(cpu);
+//     tb_flush(cpu);
+// }
+
 static void tcg_accel_ops_init(AccelOpsClass *ops)
 {
     if (qemu_tcg_mttcg_enabled()) {
@@ -218,6 +229,7 @@ static void tcg_accel_ops_init(AccelOpsClass *ops)
     ops->insert_breakpoint = tcg_insert_breakpoint;
     ops->remove_breakpoint = tcg_remove_breakpoint;
     ops->remove_all_breakpoints = tcg_remove_all_breakpoints;
+    // ops->synchronize_pre_loadvm = tcg_cpu_synchronize_pre_loadvm;
 }
 
 static void tcg_accel_ops_class_init(ObjectClass *oc, void *data)
