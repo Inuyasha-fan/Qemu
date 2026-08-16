@@ -585,7 +585,7 @@ void fuzz_coverage_record_tb(uint64_t virt_addr, uint64_t phys_addr, uint32_t in
 
 	// 覆盖率捕获范围：mode 0/2 仅记录 .text 物理范围内的 TB；
 	// mode 1 全范围收集（仍通过物理范围跟随 ASID）
-	if (config.mode != 1 && !in_text) {
+	if (asid != target_asid || (config.mode != 1 && !in_text)) {
 		g_mutex_unlock(&lock);
 		return;
 	}

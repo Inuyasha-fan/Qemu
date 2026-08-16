@@ -32,6 +32,7 @@ static bool cfg_debug;
 static bool cfg_cov_block = true;
 static bool cfg_cov_edge = true;
 static bool cfg_cov_trace = true;
+static uint64_t count =0;
 
 /* TB table: key = start vaddr, value = TbEntry */
 typedef struct {
@@ -198,6 +199,10 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 
     if (cfg_cov_edge) {
         edge_idx = (uint32_t)(cur_loc ^ prev_loc_exec);
+        // if (edge_bitmap[edge_idx] == 0) {
+        //     count++;
+        //     g_log(LOG_DOMAIN, G_LOG_LEVEL_INFO, "%d", count);
+        // }
         edge_bitmap[edge_idx]++;
         prev_loc_exec = cur_loc >> 1;
     }
